@@ -55,7 +55,11 @@ confirm() {
     local prompt="$1"
     local answer
     echo -en "${Y}${prompt} [j/N]: ${N}"
-    read -r answer
+    if [[ -c /dev/tty ]]; then
+        read -r answer </dev/tty
+    else
+        read -r answer
+    fi
     [[ "$answer" =~ ^[jJyY]$ ]]
 }
 
@@ -68,7 +72,11 @@ read_input() {
     else
         echo -en "${C}${prompt}: ${N}" >&2
     fi
-    read -r result
+    if [[ -c /dev/tty ]]; then
+        read -r result </dev/tty
+    else
+        read -r result
+    fi
     echo "${result:-$default}"
 }
 
@@ -161,9 +169,19 @@ install_dependencies() {
 
 install_nginx() {
     log_step "Nginx installieren..."
+
+    # Konfliktbehebung: Apache2 stoppen und entfernen (wird von PHP-Paketen auf Debian oft nachinstalliert)
+    systemctl stop apache2 2>/dev/null || true
+    systemctl disable apache2 2>/dev/null || true
+    apt-get purge -y apache2 apache2-utils apache2-bin 2>/dev/null || true
+
     apt-get install -y nginx
+
+    # Port-Konflikte aufräumen
+    rm -f /etc/nginx/sites-enabled/default
+
     systemctl enable nginx
-    systemctl start nginx
+    systemctl restart nginx
     log_ok "Nginx installiert und gestartet."
 }
 
@@ -209,6 +227,11 @@ install_phpmyadmin() {
     local pma_version="5.2.2"
     local pma_url="https://files.phpmyadmin.net/phpMyAdmin/${pma_version}/phpMyAdmin-${pma_version}-all-languages.tar.gz"
 
+    # Apache2 sicherheitshalber erneut stoppen & säubern
+    systemctl stop apache2 2>/dev/null || true
+    systemctl disable apache2 2>/dev/null || true
+    apt-get purge -y apache2 apache2-utils apache2-bin 2>/dev/null || true
+
     # PHP installieren
     apt-get install -y php-fpm php-mysql php-mbstring php-zip php-gd php-json php-curl php-xml
 
@@ -217,8 +240,8 @@ install_phpmyadmin() {
     php_ver=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
     local php_sock="/run/php/php${php_ver}-fpm.sock"
 
-    systemctl enable "php${php_ver}-fpm"
-    systemctl start "php${php_ver}-fpm"
+    systemctl enable "php${php_ver}-fpm" 2>/dev/null || true
+    systemctl restart "php${php_ver}-fpm" 2>/dev/null || true
 
     # phpMyAdmin herunterladen
     if [[ ! -d "$pma_dir" ]]; then
@@ -240,6 +263,7 @@ install_phpmyadmin() {
     fi
 
     # Nginx Server-Block für phpMyAdmin
+    mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
     cat > /etc/nginx/sites-available/phpmyadmin <<EONGINX
 server {
     listen 8080;
@@ -266,8 +290,9 @@ server {
 EONGINX
 
     ln -sf /etc/nginx/sites-available/phpmyadmin /etc/nginx/sites-enabled/
-    nginx -t && systemctl reload nginx
+    rm -f /etc/nginx/sites-enabled/default
 
+    nginx -t && systemctl restart nginx
     log_ok "phpMyAdmin installiert — erreichbar auf Port 8080."
 }
 
@@ -970,7 +995,7 @@ menu_manage_server() {
 
         echo ""
         echo -en "${D}Weiter mit Enter...${N}"
-        read -r
+        if [[ -c /dev/tty ]]; then read -r </dev/tty; else read -r; fi
     done
 }
 
@@ -1363,7 +1388,7 @@ main_menu() {
 
         echo ""
         echo -en "${D}Weiter mit Enter...${N}"
-        read -r
+        if [[ -c /dev/tty ]]; then read -r </dev/tty; else read -r; fi
     done
 }
 
