@@ -1,3 +1,6 @@
+#!/bin/bash
+
+# Farben & Style
 red="\e[0;91m"
 green="\e[0;92m"
 blue="\e[0;94m"
@@ -6,6 +9,7 @@ cyan="\e[0;96m"
 bold="\e[1m"
 reset="\e[0m"
 
+# Root-Check
 if [ "$EUID" -ne 0 ]; then
     echo -e "${red}Bitte führe das Skript als root aus!${reset}"
     exit 1
@@ -34,7 +38,7 @@ runCommand(){
 
 clear
 echo -e "${blue}${bold}====================================================${reset}"
-echo -e "${cyan}${bold}   FiveM Multi-Server & Database Setup Wizard      ${reset}"
+echo -e "${cyan}${bold}   FiveM Multi-Server Setup Wizard (Debian 12)     ${reset}"
 echo -e "${blue}${bold}====================================================${reset}"
 echo ""
 
@@ -125,7 +129,7 @@ done
 
 # Zusammenfassung bestätigen
 clear
-echo -e "${green}${bold}=== SETUP ZUSAMMENFASSUNG ===${reset}"
+echo -e "${green}${bold}=== SETUP ZUSAMMENFASSUNG (Debian 12 Bookworm) ===${reset}"
 echo -e "SSH Port: ${cyan}$SSH_PORT${reset}"
 echo -e "MariaDB: ${cyan}$INSTALL_MARIADB${reset} (Modus: $DB_ACCESS_CHOICE)"
 if [ "$DB_ACCESS_CHOICE" != "1" ] && [[ "$INSTALL_MARIADB" =~ ^[Yy]$ ]]; then
@@ -147,28 +151,31 @@ fi
 
 # --- EXECUTION ---
 
-# 1. Pakete installieren
+# 1. Pakete installieren für Debian 12
 install_packages(){
     runCommand "apt update -y && apt upgrade -y" "System wird aktualisiert"
-    runCommand "apt install -y curl git screen xz-utils libssl-dev mariadb-server ufw jq lsof wget" "Benötigte Pakete werden installiert"
+    runCommand "apt install -y curl git screen xz-utils libssl-dev mariadb-server ufw jq lsof wget" "Debian 12 Pakete werden installiert"
 }
 
-# 2. MariaDB einrichten
+# 2. MariaDB einrichten (Debian 12 kompatibel)
 setup_mariadb_execution(){
     if ! [[ "$INSTALL_MARIADB" =~ ^[Yy]$ ]]; then
         return
     fi
 
-    status "MariaDB konfigurieren"
-    CONF_FILE="/etc/mysql/mariadb.conf.d/50-server.cnf"
-
-    if [ -f "$CONF_FILE" ]; then
-        if [ "$DB_ACCESS_CHOICE" == "1" ]; then
-            sed -i -E 's/^\s*#?\s*bind-address\s*=.*/bind-address = 127.0.0.1/' "$CONF_FILE"
-        else
-            sed -i -E 's/^\s*#?\s*bind-address\s*=.*/bind-address = 0.0.0.0/' "$CONF_FILE"
+    status "MariaDB für Debian 12 konfigurieren"
+    
+    # Pfad-Prüfung für MariaDB Config unter Debian 12
+    CONF_FILES=("/etc/mysql/mariadb.conf.d/50-server.cnf" "/etc/mysql/my.cnf")
+    for CONF_FILE in "${CONF_FILES[@]}"; do
+        if [ -f "$CONF_FILE" ]; then
+            if [ "$DB_ACCESS_CHOICE" == "1" ]; then
+                sed -i -E 's/^\s*#?\s*bind-address\s*=.*/bind-address = 127.0.0.1/' "$CONF_FILE"
+            else
+                sed -i -E 's/^\s*#?\s*bind-address\s*=.*/bind-address = 0.0.0.0/' "$CONF_FILE"
+            fi
         fi
-    fi
+    done
     runCommand "systemctl restart mariadb"
 
     # Benutzer und Datenbanken erstellen
@@ -331,7 +338,7 @@ IP=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || hostname -I | aw
 
 clear
 echo -e "${green}${bold}====================================================${reset}"
-echo -e "${green}${bold}        SETUP UND KONFIGURATION ERFOLGREICH!       ${reset}"
+echo -e "${green}${bold}  SETUP FÜR DEBIAN 12 ERFOLGREICH ABGESCHLOSSEN!   ${reset}"
 echo -e "${green}${bold}====================================================${reset}"
 echo ""
 if [[ "$INSTALL_MARIADB" =~ ^[Yy]$ ]]; then
