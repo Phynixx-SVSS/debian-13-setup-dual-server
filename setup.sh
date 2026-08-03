@@ -1,511 +1,1461 @@
 #!/bin/bash
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FiveM Server Manager — Debian 12 Bookworm
+#  Nginx · MariaDB · phpMyAdmin · FiveM Artifacts (Recommended Stable)
+#  Multi-Instanz · UFW · Screen-Konsole · fuser Pre-Cleanup
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# Farben & Style
-red="\e[0;91m"
-green="\e[0;92m"
-blue="\e[0;94m"
-yellow="\e[0;93m"
-cyan="\e[0;96m"
-bold="\e[1m"
-reset="\e[0m"
+set -euo pipefail
 
-# Root-Check
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${red}Bitte führe das Skript als root aus!${reset}"
-    exit 1
-fi
+# ── Farben ────────────────────────────────────────────────────────────────────
+R='\033[0;31m'   G='\033[0;32m'   Y='\033[1;33m'
+C='\033[0;36m'   B='\033[1;34m'   M='\033[0;35m'
+W='\033[1;37m'   D='\033[0;90m'   N='\033[0m'
 
-status(){
-    echo -e "${green}${bold}>>> $@...${reset}"
-    sleep 1
-}
+# ── Pfade ─────────────────────────────────────────────────────────────────────
+CONFIG_DIR="/etc/fivem-manager"
+CONFIG_FILE="${CONFIG_DIR}/manager.conf"
+SERVERS_DIR="/opt/fivem/servers"
+ARTIFACTS_DIR="/opt/fivem/artifacts"
+FIVEM_USER="fivem"
+LOG_DIR="/var/log/fivem-manager"
 
-runCommand(){
-    COMMAND=$1
-    if [[ -n "$2" ]]; then
-        status "$2"
+# ── FiveM Artifacts API ──────────────────────────────────────────────────────
+VERSIONS_API="https://changelogs-live.fivem.net/api/changelog/versions/linux/server"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Hilfsfunktionen
+# ═══════════════════════════════════════════════════════════════════════════════
+
+log_info()    { echo -e "${C}[INFO]${N}  $1"; }
+log_ok()      { echo -e "${G}[OK]${N}    $1"; }
+log_warn()    { echo -e "${Y}[WARN]${N}  $1"; }
+log_error()   { echo -e "${R}[ERROR]${N} $1"; }
+log_step()    { echo -e "${B}[STEP]${N}  ${W}$1${N}"; }
+separator()   { echo -e "${D}────────────────────────────────────────────────────────────${N}"; }
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "Dieses Script muss als root ausgeführt werden."
+        exit 1
     fi
-
-    eval "$COMMAND"
-    BASH_CODE=$?
-    if [ $BASH_CODE -ne 0 ]; then
-        echo -e "${red}Fehler aufgetreten:${reset} ${COMMAND} lieferte Code ${BASH_CODE}"
-        exit ${BASH_CODE}
-    fi
 }
 
-get_server_ip(){
-    ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || hostname -I | awk '{print $1}'
+banner() {
+    clear
+    echo -e "${B}"
+    echo "  ╔══════════════════════════════════════════════════════════╗"
+    echo "  ║           FiveM Server Manager · Debian 12              ║"
+    echo "  ║     Nginx · MariaDB · phpMyAdmin · Multi-Instanz        ║"
+    echo "  ╚══════════════════════════════════════════════════════════╝"
+    echo -e "${N}"
 }
 
-# --- HELPER: SERVER HINZUFÜGEN ---
-add_single_server(){
-    S_NAME=$1
-    TX_PORT=$2
-    GAME_PORT=$3
+confirm() {
+    local prompt="$1"
+    local answer
+    echo -en "${Y}${prompt} [j/N]: ${N}"
+    read -r answer
+    [[ "$answer" =~ ^[jJyY]$ ]]
+}
 
-    id -u fivem &>/dev/null || useradd -r -m -d /home/fivem -s /bin/bash fivem
-    mkdir -p /home/fivem/artifacts
-
-    S_DIR="/home/fivem/${S_NAME}"
-    mkdir -p "${S_DIR}/data"
-    mkdir -p "${S_DIR}/txData"
-
-    START_SCRIPT="${S_DIR}/start_${S_NAME}.sh"
-    STOP_SCRIPT="${S_DIR}/stop_${S_NAME}.sh"
-    RESTART_SCRIPT="${S_DIR}/restart_${S_NAME}.sh"
-    CONSOLE_SCRIPT="${S_DIR}/console_${S_NAME}.sh"
-    PIN_SCRIPT="${S_DIR}/pin_${S_NAME}.sh"
-
-    # Start Skript mit autom. Port-Kill, Screen-Cleanup und direktem Konsole-Attach
-    cat << EOF > "$START_SCRIPT"
-#!/bin/bash
-# 1. Toten Screen-Sessions aufräumen
-screen -wipe >/dev/null 2>&1
-
-# 2. Laufende Session diesen Namens beenden falls vorhanden
-if screen -ls 2>/dev/null | grep -v "Dead" | grep -q "\.${S_NAME}\s"; then
-    echo -e "\e[93mStoppe laufende Session von '${S_NAME}'...\e[0m"
-    screen -X -S ${S_NAME} quit >/dev/null 2>&1
-    sleep 1
-fi
-
-# 3. Ports (txAdmin Port, Game TCP, Game UDP) garantiert freigeben/killen
-echo -e "\e[94mBereinige Ports (txAdmin: ${TX_PORT}, Game: ${GAME_PORT})...\e[0m"
-fuser -k ${TX_PORT}/tcp >/dev/null 2>&1
-fuser -k ${GAME_PORT}/tcp >/dev/null 2>&1
-fuser -k ${GAME_PORT}/udp >/dev/null 2>&1
-sleep 1
-
-echo "Starte FiveM Server '${S_NAME}'..."
-cd ${S_DIR}/data || exit 1
-
-chmod -R +x /home/fivem/artifacts 2>/dev/null
-> ${S_DIR}/txadmin.log
-
-# Server starten
-screen -L -Logfile ${S_DIR}/txadmin.log -dmS ${S_NAME} bash -c "/home/fivem/artifacts/run.sh +set txAdminPort ${TX_PORT} +set txDataPath ${S_DIR}/txData +set serverProfile ${S_NAME} >> ${S_DIR}/txadmin.log 2>&1"
-
-sleep 2
-
-# Pruefen ob der Screen laeuft & direkt verbinden
-if screen -ls 2>/dev/null | grep -v "Dead" | grep -q "\.${S_NAME}\s"; then
-    echo -e "\e[92mServer '${S_NAME}' gestartet! Verbinde mit Live-Konsole...\e[0m"
-    echo -e "\e[93m(Zum Verlassen der Konsole drücken: STRG + A, danach D)\e[0m"
-    sleep 2
-    screen -r ${S_NAME} || screen -x ${S_NAME}
-else
-    echo -e "\e[91mFEHLER: Server '${S_NAME}' konnte nicht gestartet werden!\e[0m"
-    echo -e "\e[93mLetzte Log-Einträge (/home/fivem/${S_NAME}/txadmin.log):\e[0m"
-    echo "----------------------------------------------------"
-    tail -n 25 ${S_DIR}/txadmin.log 2>/dev/null || echo "Kein Log vorhanden."
-    echo "----------------------------------------------------"
-fi
-EOF
-
-    # Stop Skript mit Kill-Fallback für Portfreigabe
-    cat << EOF > "$STOP_SCRIPT"
-#!/bin/bash
-echo "Stoppe FiveM Server '${S_NAME}'..."
-screen -wipe >/dev/null 2>&1
-if screen -ls 2>/dev/null | grep -v "Dead" | grep -q "\.${S_NAME}\s"; then
-    screen -S ${S_NAME} -X stuff $'\003'
-    sleep 2
-    screen -X -S ${S_NAME} quit 2>/dev/null
-fi
-
-fuser -k ${TX_PORT}/tcp >/dev/null 2>&1
-fuser -k ${GAME_PORT}/tcp >/dev/null 2>&1
-fuser -k ${GAME_PORT}/udp >/dev/null 2>&1
-screen -wipe >/dev/null 2>&1
-
-echo "Server '${S_NAME}' gestoppt."
-EOF
-
-    # Restart Skript
-    cat << EOF > "$RESTART_SCRIPT"
-#!/bin/bash
-${STOP_SCRIPT}
-sleep 2
-${START_SCRIPT}
-EOF
-
-    # Live-Konsole / Screen Attach Skript
-    cat << EOF > "$CONSOLE_SCRIPT"
-#!/bin/bash
-screen -wipe >/dev/null 2>&1
-if ! screen -ls 2>/dev/null | grep -v "Dead" | grep -q "\.${S_NAME}\s"; then
-    echo "Server '${S_NAME}' läuft derzeit nicht."
-    exit 1
-fi
-echo -e "\e[1m\e[92mVerbinde mit Live-Konsole von '${S_NAME}'...\e[0m"
-echo -e "\e[1m\e[93mHINWEIS: Zum Verlassen der Konsole drücken: STRG + A, danach D\e[0m"
-sleep 2
-screen -r ${S_NAME} || screen -x ${S_NAME}
-EOF
-
-    # PIN Skript
-    cat << EOF > "$PIN_SCRIPT"
-#!/bin/bash
-if [ -f "${S_DIR}/txadmin.log" ]; then
-    PIN=\$(grep -oP 'PIN:\s*\K[0-9]{4}' ${S_DIR}/txadmin.log 2>/dev/null | tail -n 1)
-    if [ -n "\$PIN" ]; then
-        echo -e "\e[1m\e[92mtxAdmin PIN für ${S_NAME}: \e[93m\$PIN\e[0m"
+read_input() {
+    local prompt="$1"
+    local default="${2:-}"
+    local result
+    if [[ -n "$default" ]]; then
+        echo -en "${C}${prompt} [${default}]: ${N}"
     else
-        echo "Kein PIN im Log gefunden. Siehe Konsole: /home/fivem/console_${S_NAME}.sh"
+        echo -en "${C}${prompt}: ${N}"
     fi
-else
-    echo "Logdatei existiert nicht. Starte den Server zuerst."
-fi
+    read -r result
+    echo "${result:-$default}"
+}
+
+# Konfiguration laden / initialisieren
+init_config() {
+    mkdir -p "$CONFIG_DIR" "$LOG_DIR"
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        cat > "$CONFIG_FILE" <<EOF
+# FiveM Manager Konfiguration
+# Automatisch generiert — $(date)
+INSTALLED=0
+FIVEM_USER=${FIVEM_USER}
+SERVERS_DIR=${SERVERS_DIR}
+ARTIFACTS_DIR=${ARTIFACTS_DIR}
+ARTIFACT_BUILD=
+ARTIFACT_URL=
+SERVER_COUNT=0
 EOF
-
-    chmod +x "$START_SCRIPT" "$STOP_SCRIPT" "$RESTART_SCRIPT" "$CONSOLE_SCRIPT" "$PIN_SCRIPT"
-
-    # Symlinks in /home/fivem
-    ln -sf "$START_SCRIPT" "/home/fivem/start_${S_NAME}.sh"
-    ln -sf "$STOP_SCRIPT" "/home/fivem/stop_${S_NAME}.sh"
-    ln -sf "$RESTART_SCRIPT" "/home/fivem/restart_${S_NAME}.sh"
-    ln -sf "$CONSOLE_SCRIPT" "/home/fivem/console_${S_NAME}.sh"
-    ln -sf "$PIN_SCRIPT" "/home/fivem/pin_${S_NAME}.sh"
-
-    # Firewall Ports
-    ufw allow ${TX_PORT}/tcp comment "txAdmin ${S_NAME}" >/dev/null 2>&1
-    ufw allow ${GAME_PORT}/tcp comment "FiveM Game TCP ${S_NAME}" >/dev/null 2>&1
-    ufw allow ${GAME_PORT}/udp comment "FiveM Game UDP ${S_NAME}" >/dev/null 2>&1
-
-    chown -R fivem:fivem /home/fivem
+    fi
+    source "$CONFIG_FILE"
 }
 
-# --- PHPMYADMIN INSTALLATION ---
-setup_phpmyadmin(){
-    status "Installiere phpMyAdmin & Apache2 Webserver"
-    echo "phpmyadmin phpmyadmin/dbconfig-install boolean false" | debconf-set-selections
-    echo "phpmyadmin phpmyadmin/reconfigure-webserver multiselect apache2" | debconf-set-selections
-
-    DEBIAN_FRONTEND=noninteractive apt-get install -y apache2 php php-mysql php-mbstring php-zip php-gd php-curl phpmyadmin >/dev/null 2>&1
-    
-    systemctl enable apache2 >/dev/null 2>&1
-    systemctl restart apache2 >/dev/null 2>&1
-
-    ufw allow 80/tcp comment 'HTTP phpMyAdmin' >/dev/null 2>&1
-
-    IP=$(get_server_ip)
-    echo -e "${green}${bold}phpMyAdmin erfolgreich installiert!${reset}"
-    echo -e "Erreichbar unter: ${blue}http://${IP}/phpmyadmin${reset}"
+save_config_var() {
+    local key="$1" val="$2"
+    if grep -q "^${key}=" "$CONFIG_FILE" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${val}|" "$CONFIG_FILE"
+    else
+        echo "${key}=${val}" >> "$CONFIG_FILE"
+    fi
 }
 
-# --- UNINSTALL / PURGE ALL ---
-purge_everything(){
-    clear
-    echo -e "${red}${bold}====================================================${reset}"
-    echo -e "${red}${bold}           WARNUNG: ALLES LÖSCHEN (PURGE)           ${reset}"
-    echo -e "${red}${bold}====================================================${reset}"
-    echo -e "Dies wird:"
-    echo -e "  - Alle laufenden FiveM Server-Sessions beenden"
-    echo -e "  - Den Ordner /home/fivem und den User 'fivem' komplett löschen"
-    echo -e "  - phpMyAdmin & Apache2 (optional) entfernen"
-    echo -e "  - Eingestellte UFW Firewall-Regeln zurücksetzen"
-    echo ""
-    read -r -p "$(echo -e "${red}${bold}Bist du WIRKLICH sicher? (schreibe 'JA'): ${reset}")" CONFIRM_PURGE
-
-    if [ "$CONFIRM_PURGE" != "JA" ]; then
-        echo -e "${yellow}Abgebrochen.${reset}"
-        return
-    fi
-
-    status "Stoppe alle FiveM Server Sessions"
-    screen -ls | grep -oP '\t[0-9]+\.\K\S+' | xargs -r -I{} screen -X -S {} quit 2>/dev/null
-    screen -wipe >/dev/null 2>&1
-
-    status "Lösche User 'fivem' und /home/fivem"
-    userdel -r fivem 2>/dev/null
-    rm -rf /home/fivem
-
-    read -r -p "$(echo -e "${yellow}Auch MariaDB Datenbank-User löschen? (y/n) [Standard: y]: ${reset}")" RM_DB
-    RM_DB=${RM_DB:-y}
-    if [[ "$RM_DB" =~ ^[Yy]$ ]]; then
-        read -r -p "$(echo -e "${yellow}Name des DB-Users zum Löschen [Standard: external_admin]: ${reset}")" DEL_USER
-        DEL_USER=${DEL_USER:-external_admin}
-        mariadb -e "DROP USER IF EXISTS '${DEL_USER}'@'%';" 2>/dev/null
-        mariadb -e "DROP USER IF EXISTS '${DEL_USER}'@'localhost';" 2>/dev/null
-        mariadb -e "FLUSH PRIVILEGES;" 2>/dev/null
-    fi
-
-    read -r -p "$(echo -e "${yellow}Auch phpMyAdmin & Apache2 deinstallieren? (y/n) [Standard: y]: ${reset}")" RM_PMA
-    RM_PMA=${RM_PMA:-y}
-    if [[ "$RM_PMA" =~ ^[Yy]$ ]]; then
-        status "Deinstalliere phpMyAdmin & Apache2"
-        DEBIAN_FRONTEND=noninteractive apt-get purge -y phpmyadmin apache2 php* >/dev/null 2>&1
-        apt-get autoremove -y >/dev/null 2>&1
-    fi
-
-    status "Firewall-Regeln zurücksetzen (UFW)"
-    ufw disable >/dev/null 2>&1
-    ufw --force reset >/dev/null 2>&1
-    ufw allow 22/tcp comment 'SSH' >/dev/null 2>&1
-    echo "y" | ufw enable >/dev/null 2>&1
-
-    echo -e "${green}${bold}Alles wurde erfolgreich gelöscht!${reset}"
+# Server-Konfigurationsdatei
+get_server_conf() {
+    echo "${CONFIG_DIR}/server_${1}.conf"
 }
 
-# --- NACHTRÄGLICH SERVER HINZUFÜGEN ---
-menu_add_server(){
-    clear
-    echo -e "${cyan}${bold}--- Neuen FiveM Server hinzufügen ---${reset}"
-    read -r -p "$(echo -e "${yellow}Server Name (z. B. server2, roleplay): ${reset}")" S_NAME
-    if [ -z "$S_NAME" ]; then
-        echo -e "${red}Name darf nicht leer sein!${reset}"
-        return
-    fi
-    S_NAME=$(echo "$S_NAME" | sed 's/[^a-zA-Z0-9_-]/_/g')
-
-    if [ -d "/home/fivem/${S_NAME}" ]; then
-        echo -e "${red}Server '${S_NAME}' existiert bereits!${reset}"
-        return
-    fi
-
-    EXISTING_COUNT=$(find /home/fivem/ -maxdepth 1 -type d -name "server*" 2>/dev/null | wc -l)
-    DEFAULT_TX=$((40120 + EXISTING_COUNT))
-    DEFAULT_GAME=$((30120 + EXISTING_COUNT * 5))
-
-    read -r -p "$(echo -e "${yellow}txAdmin Port [Standard: $DEFAULT_TX]: ${reset}")" TX_PORT
-    TX_PORT=${TX_PORT:-$DEFAULT_TX}
-
-    read -r -p "$(echo -e "${yellow}Game Port (TCP/UDP) [Standard: $DEFAULT_GAME]: ${reset}")" GAME_PORT
-    GAME_PORT=${GAME_PORT:-$DEFAULT_GAME}
-
-    add_single_server "$S_NAME" "$TX_PORT" "$GAME_PORT"
-
-    echo "/home/fivem/${S_NAME}/start_${S_NAME}.sh" >> /home/fivem/start_all.sh 2>/dev/null
-    echo "/home/fivem/${S_NAME}/stop_${S_NAME}.sh" >> /home/fivem/stop_all.sh 2>/dev/null
-
-    IP=$(get_server_ip)
-    echo -e "\n${green}${bold}Server '${S_NAME}' erfolgreich hinzugefügt!${reset}"
-    echo -e "  Starten:      ${yellow}runuser -u fivem -- /home/fivem/start_${S_NAME}.sh${reset}"
-    echo -e "  Live-Konsole: ${yellow}runuser -u fivem -- /home/fivem/console_${S_NAME}.sh${reset}"
-    echo -e "  Stoppen:      ${yellow}runuser -u fivem -- /home/fivem/stop_${S_NAME}.sh${reset}"
-    echo -e "  txAdmin:      ${blue}http://${IP}:${TX_PORT}${reset}"
+save_server_conf() {
+    local name="$1" tcp_port="$2" udp_port="$3" txadmin_port="$4" rcon_pass="$5"
+    local conf
+    conf=$(get_server_conf "$name")
+    cat > "$conf" <<EOF
+SERVER_NAME=${name}
+TCP_PORT=${tcp_port}
+UDP_PORT=${udp_port}
+TXADMIN_PORT=${txadmin_port}
+RCON_PASSWORD=${rcon_pass}
+CREATED=$(date +%Y-%m-%d_%H:%M:%S)
+EOF
 }
 
-# --- ERSTINSTALLATION ---
-full_installation(){
-    clear
-    echo -e "${cyan}${bold}--- Erstinstallation (Debian 12) ---${reset}"
-
-    read -r -p "$(echo -e "${yellow}SSH-Port [Standard: 22]: ${reset}")" SSH_PORT
-    SSH_PORT=${SSH_PORT:-22}
-
-    echo -e "\n${cyan}${bold}--- MariaDB Konfiguration ---${reset}"
-    read -r -p "$(echo -e "${yellow}MariaDB installieren? (y/n) [Standard: y]: ${reset}")" INSTALL_MARIADB
-    INSTALL_MARIADB=${INSTALL_MARIADB:-y}
-
-    DB_ACCESS_CHOICE="1"
-    DB_USER=""
-    DB_PASS=""
-    ALLOWED_DB_IP=""
-
-    if [[ "$INSTALL_MARIADB" =~ ^[Yy]$ ]]; then
-        echo -e "\nWähle den MariaDB Zugriffsmodus:"
-        echo -e "  1) Nur Lokal (127.0.0.1)"
-        echo -e "  2) Extern erreichbar (Alle IPs - 0.0.0.0 / %)"
-        echo -e "  3) Extern erreichbar (Nur bestimmte IP)"
-        read -r -p "$(echo -e "${yellow}Auswahl [1-3] [Standard: 1]: ${reset}")" DB_ACCESS_CHOICE
-        DB_ACCESS_CHOICE=${DB_ACCESS_CHOICE:-1}
-
-        if [ "$DB_ACCESS_CHOICE" != "1" ]; then
-            read -r -p "$(echo -e "${yellow}Name für DB-Benutzer [Standard: external_admin]: ${reset}")" DB_USER
-            DB_USER=${DB_USER:-external_admin}
-            while [ -z "$DB_PASS" ]; do
-                read -r -p "$(echo -e "${yellow}Passwort für DB-User '$DB_USER': ${reset}")" DB_PASS
-            done
-            if [ "$DB_ACCESS_CHOICE" == "3" ]; then
-                while [ -z "$ALLOWED_DB_IP" ]; do
-                    read -r -p "$(echo -e "${yellow}Erlaubte externe IP: ${reset}")" ALLOWED_DB_IP
-                done
-            fi
-        fi
-    fi
-
-    read -r -p "$(echo -e "${yellow}\nphpMyAdmin installieren? (y/n) [Standard: y]: ${reset}")" INSTALL_PMA
-    INSTALL_PMA=${INSTALL_PMA:-y}
-
-    echo -e "\n${cyan}${bold}--- FiveM Server Konfiguration ---${reset}"
-    read -r -p "$(echo -e "${yellow}Wie viele Server initial anlegen? [Standard: 1]: ${reset}")" SERVER_COUNT
-    SERVER_COUNT=${SERVER_COUNT:-1}
-
-    declare -a SERVER_NAMES
-    declare -a TX_PORTS
-    declare -a GAME_PORTS
-
-    for ((i=1; i<=SERVER_COUNT; i++)); do
-        echo -e "\nServer #$i:"
-        DEFAULT_NAME="server$i"
-        read -r -p "$(echo -e "${yellow}Server Name [Standard: $DEFAULT_NAME]: ${reset}")" S_NAME
-        S_NAME=${S_NAME:-$DEFAULT_NAME}
-        S_NAME=$(echo "$S_NAME" | sed 's/[^a-zA-Z0-9_-]/_/g')
-        SERVER_NAMES+=("$S_NAME")
-
-        DEFAULT_TX=$((40120 + i - 1))
-        read -r -p "$(echo -e "${yellow}txAdmin Port [Standard: $DEFAULT_TX]: ${reset}")" TX_P
-        TX_PORTS+=("${TX_P:-$DEFAULT_TX}")
-
-        DEFAULT_GAME=$((30120 + (i - 1) * 5))
-        read -r -p "$(echo -e "${yellow}Game Port [Standard: $DEFAULT_GAME]: ${reset}")" G_P
-        GAME_PORTS+=("${G_P:-$DEFAULT_GAME}")
+list_server_names() {
+    local servers=()
+    for conf in "${CONFIG_DIR}"/server_*.conf; do
+        [[ -f "$conf" ]] || continue
+        local name
+        name=$(grep '^SERVER_NAME=' "$conf" | cut -d= -f2)
+        servers+=("$name")
     done
+    echo "${servers[@]}"
+}
 
-    status "Installiere Grundpakete"
-    runCommand "apt update -y && apt upgrade -y"
-    runCommand "apt install -y curl git screen xz-utils libssl-dev mariadb-server ufw jq lsof wget"
+count_servers() {
+    local count=0
+    for conf in "${CONFIG_DIR}"/server_*.conf; do
+        [[ -f "$conf" ]] && ((count++))
+    done
+    echo "$count"
+}
 
-    # MariaDB Setup
-    if [[ "$INSTALL_MARIADB" =~ ^[Yy]$ ]]; then
-        CONF_FILES=("/etc/mysql/mariadb.conf.d/50-server.cnf" "/etc/mysql/my.cnf")
-        for CONF_FILE in "${CONF_FILES[@]}"; do
-            if [ -f "$CONF_FILE" ]; then
-                if [ "$DB_ACCESS_CHOICE" == "1" ]; then
-                    sed -i -E 's/^\s*#?\s*bind-address\s*=.*/bind-address = 127.0.0.1/' "$CONF_FILE"
-                else
-                    sed -i -E 's/^\s*#?\s*bind-address\s*=.*/bind-address = 0.0.0.0/' "$CONF_FILE"
-                fi
-            fi
+gen_password() {
+    tr -dc 'A-Za-z0-9!@#$%' < /dev/urandom | head -c 24
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Installation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+install_dependencies() {
+    log_step "System-Pakete aktualisieren & Abhängigkeiten installieren..."
+    apt-get update -y
+    apt-get upgrade -y
+    apt-get install -y \
+        curl wget git unzip xz-utils screen htop \
+        ufw psmisc net-tools lsof \
+        software-properties-common apt-transport-https \
+        ca-certificates gnupg jq \
+        libatomic1 libc6
+    log_ok "Abhängigkeiten installiert."
+}
+
+install_nginx() {
+    log_step "Nginx installieren..."
+    apt-get install -y nginx
+    systemctl enable nginx
+    systemctl start nginx
+    log_ok "Nginx installiert und gestartet."
+}
+
+install_mariadb() {
+    log_step "MariaDB installieren..."
+    apt-get install -y mariadb-server mariadb-client
+
+    systemctl enable mariadb
+    systemctl start mariadb
+
+    log_info "MariaDB für Remote-Zugriff konfigurieren..."
+
+    # Bind auf alle Interfaces
+    local mariadb_conf="/etc/mysql/mariadb.conf.d/50-server.cnf"
+    if [[ -f "$mariadb_conf" ]]; then
+        sed -i 's/^bind-address\s*=.*/bind-address = 0.0.0.0/' "$mariadb_conf"
+    fi
+
+    systemctl restart mariadb
+    log_ok "MariaDB installiert — Remote-Zugriff aktiv (0.0.0.0)."
+}
+
+setup_mariadb_user() {
+    local db_user="$1" db_pass="$2"
+
+    log_step "MariaDB Benutzer '${db_user}' einrichten (Zugriff von überall)..."
+
+    mysql -u root <<EOSQL
+CREATE USER IF NOT EXISTS '${db_user}'@'%' IDENTIFIED BY '${db_pass}';
+GRANT ALL PRIVILEGES ON *.* TO '${db_user}'@'%' WITH GRANT OPTION;
+CREATE USER IF NOT EXISTS '${db_user}'@'localhost' IDENTIFIED BY '${db_pass}';
+GRANT ALL PRIVILEGES ON *.* TO '${db_user}'@'localhost' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+EOSQL
+
+    log_ok "MariaDB Benutzer '${db_user}' erstellt — Zugriff von überall."
+}
+
+install_phpmyadmin() {
+    log_step "phpMyAdmin installieren..."
+
+    local pma_dir="/usr/share/phpmyadmin"
+    local pma_version="5.2.2"
+    local pma_url="https://files.phpmyadmin.net/phpMyAdmin/${pma_version}/phpMyAdmin-${pma_version}-all-languages.tar.gz"
+
+    # PHP installieren
+    apt-get install -y php-fpm php-mysql php-mbstring php-zip php-gd php-json php-curl php-xml
+
+    # PHP-FPM Version ermitteln
+    local php_ver
+    php_ver=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+    local php_sock="/run/php/php${php_ver}-fpm.sock"
+
+    systemctl enable "php${php_ver}-fpm"
+    systemctl start "php${php_ver}-fpm"
+
+    # phpMyAdmin herunterladen
+    if [[ ! -d "$pma_dir" ]]; then
+        cd /tmp
+        wget -q "$pma_url" -O phpmyadmin.tar.gz
+        tar xzf phpmyadmin.tar.gz
+        mv "phpMyAdmin-${pma_version}-all-languages" "$pma_dir"
+        rm -f phpmyadmin.tar.gz
+
+        # Blowfish Secret generieren
+        local blowfish
+        blowfish=$(gen_password)
+        cp "${pma_dir}/config.sample.inc.php" "${pma_dir}/config.inc.php"
+        sed -i "s|\$cfg\['blowfish_secret'\] = ''|\$cfg['blowfish_secret'] = '${blowfish}'|" "${pma_dir}/config.inc.php"
+
+        # Temp-Verzeichnis
+        mkdir -p "${pma_dir}/tmp"
+        chown -R www-data:www-data "$pma_dir"
+    fi
+
+    # Nginx Server-Block für phpMyAdmin
+    cat > /etc/nginx/sites-available/phpmyadmin <<EONGINX
+server {
+    listen 8080;
+    listen [::]:8080;
+    server_name _;
+    root ${pma_dir};
+    index index.php index.html;
+
+    location / {
+        try_files \$uri \$uri/ /index.php?\$args;
+    }
+
+    location ~ \.php\$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:${php_sock};
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include fastcgi_params;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EONGINX
+
+    ln -sf /etc/nginx/sites-available/phpmyadmin /etc/nginx/sites-enabled/
+    nginx -t && systemctl reload nginx
+
+    log_ok "phpMyAdmin installiert — erreichbar auf Port 8080."
+}
+
+download_fivem_artifacts() {
+    log_step "FiveM Artifacts (Recommended Stable) herunterladen..."
+
+    # API abfragen
+    local api_response
+    api_response=$(curl -s "$VERSIONS_API")
+
+    local build_num download_url
+    build_num=$(echo "$api_response" | jq -r '.recommended')
+    download_url=$(echo "$api_response" | jq -r '.recommended_download')
+
+    if [[ -z "$build_num" || "$build_num" == "null" ]]; then
+        log_error "Konnte FiveM Artifacts-Version nicht ermitteln."
+        return 1
+    fi
+
+    log_info "Recommended Build: ${build_num}"
+    log_info "Download: ${download_url}"
+
+    mkdir -p "$ARTIFACTS_DIR"
+
+    # Herunterladen und entpacken
+    cd /tmp
+    wget -q --show-progress "$download_url" -O fx.tar.xz
+    tar xf fx.tar.xz -C "$ARTIFACTS_DIR"
+    rm -f fx.tar.xz
+
+    # Ausführbar machen
+    chmod +x "${ARTIFACTS_DIR}/run.sh" 2>/dev/null || true
+    find "$ARTIFACTS_DIR" -name "FXServer" -exec chmod +x {} \; 2>/dev/null || true
+
+    save_config_var "ARTIFACT_BUILD" "$build_num"
+    save_config_var "ARTIFACT_URL" "$download_url"
+
+    log_ok "FiveM Artifacts Build ${build_num} installiert in ${ARTIFACTS_DIR}."
+}
+
+create_system_user() {
+    local username="$1" password="$2"
+
+    log_step "System-Benutzer '${username}' erstellen..."
+
+    if id "$username" &>/dev/null; then
+        log_warn "Benutzer '${username}' existiert bereits."
+    else
+        useradd -m -s /bin/bash -d "/home/${username}" "$username"
+        echo "${username}:${password}" | chpasswd
+        usermod -aG sudo "$username" 2>/dev/null || true
+        log_ok "Benutzer '${username}' erstellt."
+    fi
+
+    # Verzeichnisstruktur
+    mkdir -p "$SERVERS_DIR" "$ARTIFACTS_DIR"
+    chown -R "${username}:${username}" /opt/fivem
+}
+
+setup_firewall() {
+    log_step "UFW Firewall einrichten..."
+
+    ufw --force enable
+    ufw default deny incoming
+    ufw default allow outgoing
+
+    # Standard-Ports
+    ufw allow 22/tcp     comment 'SSH'
+    ufw allow 80/tcp     comment 'HTTP'
+    ufw allow 443/tcp    comment 'HTTPS'
+    ufw allow 8080/tcp   comment 'phpMyAdmin'
+    ufw allow 3306/tcp   comment 'MariaDB'
+
+    ufw reload
+    log_ok "Firewall Grundkonfiguration aktiv."
+}
+
+open_server_ports() {
+    local name="$1" tcp_port="$2" udp_port="$3" txadmin_port="$4"
+
+    log_info "Firewall-Ports öffnen für Server '${name}'..."
+
+    ufw allow "${tcp_port}/tcp"  comment "FiveM ${name} TCP"
+    ufw allow "${udp_port}/udp"  comment "FiveM ${name} UDP"
+    ufw allow "${txadmin_port}/tcp" comment "txAdmin ${name}"
+
+    ufw reload
+    log_ok "Ports ${tcp_port}/tcp, ${udp_port}/udp, ${txadmin_port}/tcp geöffnet."
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Server erstellen
+# ═══════════════════════════════════════════════════════════════════════════════
+
+create_server() {
+    local name tcp_port udp_port txadmin_port rcon_pass server_dir
+
+    separator
+    echo -e "${W}Neuen FiveM Server erstellen${N}"
+    separator
+
+    name=$(read_input "Server-Name (ohne Leerzeichen)" "server1")
+    name=$(echo "$name" | tr ' ' '_' | tr '[:upper:]' '[:lower:]')
+
+    # Prüfen ob Server existiert
+    if [[ -f "$(get_server_conf "$name")" ]]; then
+        log_error "Server '${name}' existiert bereits!"
+        return 1
+    fi
+
+    tcp_port=$(read_input "Game TCP Port" "30120")
+    udp_port=$(read_input "Game UDP Port" "${tcp_port}")
+    txadmin_port=$(read_input "txAdmin Web-Port" "40120")
+    rcon_pass=$(read_input "RCON Passwort" "$(gen_password)")
+
+    server_dir="${SERVERS_DIR}/${name}"
+
+    log_step "Server '${name}' einrichten..."
+
+    # Verzeichnisstruktur
+    mkdir -p "${server_dir}/resources" "${server_dir}/cache" "${server_dir}/data"
+
+    # server.cfg generieren
+    cat > "${server_dir}/server.cfg" <<EOCFG
+# ═══════════════════════════════════════════════════════════════
+# FiveM Server Konfiguration — ${name}
+# Generiert: $(date)
+# ═══════════════════════════════════════════════════════════════
+
+# ── Netzwerk ──────────────────────────────────────────────────
+endpoint_add_tcp "0.0.0.0:${tcp_port}"
+endpoint_add_udp "0.0.0.0:${udp_port}"
+
+# ── Server-Info ───────────────────────────────────────────────
+sv_hostname "${name} — FiveM Server"
+sv_maxclients 48
+sets sv_projectName "${name}"
+sets sv_projectDesc "FiveM Server managed by FiveM Server Manager"
+sets locale "de-DE"
+sets tags "default"
+
+# ── RCON ──────────────────────────────────────────────────────
+rcon_password "${rcon_pass}"
+
+# ── Sicherheit ────────────────────────────────────────────────
+sv_endpointprivacy true
+sv_scriptHookAllowed 0
+
+# ── Lizenz ────────────────────────────────────────────────────
+# Trage deinen cfx.re Lizenzschlüssel hier ein:
+# sv_licenseKey "DEIN_LIZENZ_KEY"
+
+# ── Steam Web API (optional) ─────────────────────────────────
+# set steam_webApiKey "DEIN_STEAM_API_KEY"
+
+# ── Ressourcen ────────────────────────────────────────────────
+ensure mapmanager
+ensure chat
+ensure spawnmanager
+ensure sessionmanager
+ensure basic-gamemode
+ensure hardcap
+ensure rconlog
+
+# ── OneSync ───────────────────────────────────────────────────
+set onesync on
+
+# ── Datenbank (oxmysql) ──────────────────────────────────────
+# set mysql_connection_string "mysql://user:password@localhost/database?charset=utf8mb4"
+EOCFG
+
+    # Start-Script pro Server
+    cat > "${server_dir}/start.sh" <<EOSTART
+#!/bin/bash
+cd "${server_dir}"
+exec ${ARTIFACTS_DIR}/run.sh +exec server.cfg
+EOSTART
+    chmod +x "${server_dir}/start.sh"
+
+    # Systemd Service erstellen
+    cat > "/etc/systemd/system/fivem-${name}.service" <<EOSERVICE
+[Unit]
+Description=FiveM Server — ${name}
+After=network.target mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=${FIVEM_USER}
+Group=${FIVEM_USER}
+WorkingDirectory=${server_dir}
+ExecStartPre=/bin/bash -c 'fuser -k ${tcp_port}/tcp ${udp_port}/udp 2>/dev/null || true'
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/bin/screen -dmS fivem-${name} ${server_dir}/start.sh
+ExecStop=/usr/bin/screen -S fivem-${name} -X quit
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOSERVICE
+
+    systemctl daemon-reload
+    systemctl enable "fivem-${name}.service"
+
+    # Eigentümer setzen
+    chown -R "${FIVEM_USER}:${FIVEM_USER}" "${server_dir}"
+
+    # Firewall-Ports öffnen
+    open_server_ports "$name" "$tcp_port" "$udp_port" "$txadmin_port"
+
+    # Server-Konfiguration speichern
+    save_server_conf "$name" "$tcp_port" "$udp_port" "$txadmin_port" "$rcon_pass"
+
+    # Zähler aktualisieren
+    local count
+    count=$(count_servers)
+    save_config_var "SERVER_COUNT" "$count"
+
+    separator
+    log_ok "Server '${name}' erstellt!"
+    echo -e "  ${D}Verzeichnis:${N}    ${server_dir}"
+    echo -e "  ${D}Game Port:${N}      ${tcp_port}/tcp, ${udp_port}/udp"
+    echo -e "  ${D}txAdmin Port:${N}   ${txadmin_port}"
+    echo -e "  ${D}RCON Passwort:${N}  ${rcon_pass}"
+    echo -e "  ${D}Service:${N}        fivem-${name}.service"
+    echo -e "  ${D}Screen:${N}         screen -r fivem-${name}"
+    separator
+}
+
+create_multiple_servers() {
+    local count
+    count=$(read_input "Wie viele Server sollen erstellt werden?" "1")
+
+    if ! [[ "$count" =~ ^[0-9]+$ ]] || [[ "$count" -lt 1 ]]; then
+        log_error "Ungültige Anzahl."
+        return 1
+    fi
+
+    local base_port
+    base_port=$(read_input "Basis-Game-Port (wird pro Server um 1 erhöht)" "30120")
+    local base_txport
+    base_txport=$(read_input "Basis-txAdmin-Port (wird pro Server um 1 erhöht)" "40120")
+
+    for ((i=1; i<=count; i++)); do
+        local srv_name="server${i}"
+        local srv_tcp=$((base_port + i - 1))
+        local srv_udp=$srv_tcp
+        local srv_txadmin=$((base_txport + i - 1))
+        local srv_rcon
+        srv_rcon=$(gen_password)
+
+        # Prüfen ob schon existiert — Name inkrementieren
+        while [[ -f "$(get_server_conf "$srv_name")" ]]; do
+            local num
+            num=$(echo "$srv_name" | grep -oP '\d+$')
+            num=$((num + 1))
+            srv_name="server${num}"
         done
-        systemctl restart mariadb
 
-        if [ "$DB_ACCESS_CHOICE" != "1" ]; then
-            ESCAPED_DB_PASS=$(printf '%s' "$DB_PASS" | sed "s/'/''/g")
-            HOST_SPEC="%"
-            if [ "$DB_ACCESS_CHOICE" == "3" ]; then
-                HOST_SPEC="$ALLOWED_DB_IP"
+        local server_dir="${SERVERS_DIR}/${srv_name}"
+
+        log_step "Server ${i}/${count}: '${srv_name}' (Port ${srv_tcp})..."
+
+        mkdir -p "${server_dir}/resources" "${server_dir}/cache" "${server_dir}/data"
+
+        cat > "${server_dir}/server.cfg" <<EOCFG
+endpoint_add_tcp "0.0.0.0:${srv_tcp}"
+endpoint_add_udp "0.0.0.0:${srv_udp}"
+sv_hostname "${srv_name} — FiveM Server"
+sv_maxclients 48
+sets sv_projectName "${srv_name}"
+sets sv_projectDesc "FiveM Server managed by FiveM Server Manager"
+sets locale "de-DE"
+sets tags "default"
+rcon_password "${srv_rcon}"
+sv_endpointprivacy true
+sv_scriptHookAllowed 0
+# sv_licenseKey "DEIN_LIZENZ_KEY"
+ensure mapmanager
+ensure chat
+ensure spawnmanager
+ensure sessionmanager
+ensure basic-gamemode
+ensure hardcap
+ensure rconlog
+set onesync on
+EOCFG
+
+        cat > "${server_dir}/start.sh" <<EOSTART
+#!/bin/bash
+cd "${server_dir}"
+exec ${ARTIFACTS_DIR}/run.sh +exec server.cfg
+EOSTART
+        chmod +x "${server_dir}/start.sh"
+
+        cat > "/etc/systemd/system/fivem-${srv_name}.service" <<EOSERVICE
+[Unit]
+Description=FiveM Server — ${srv_name}
+After=network.target mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=${FIVEM_USER}
+Group=${FIVEM_USER}
+WorkingDirectory=${server_dir}
+ExecStartPre=/bin/bash -c 'fuser -k ${srv_tcp}/tcp ${srv_udp}/udp 2>/dev/null || true'
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/bin/screen -dmS fivem-${srv_name} ${server_dir}/start.sh
+ExecStop=/usr/bin/screen -S fivem-${srv_name} -X quit
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOSERVICE
+
+        chown -R "${FIVEM_USER}:${FIVEM_USER}" "${server_dir}"
+        open_server_ports "$srv_name" "$srv_tcp" "$srv_udp" "$srv_txadmin"
+        save_server_conf "$srv_name" "$srv_tcp" "$srv_udp" "$srv_txadmin" "$srv_rcon"
+    done
+
+    systemctl daemon-reload
+
+    local total
+    total=$(count_servers)
+    save_config_var "SERVER_COUNT" "$total"
+
+    log_ok "${count} Server erstellt. Gesamt: ${total} Server."
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Server-Verwaltung
+# ═══════════════════════════════════════════════════════════════════════════════
+
+kill_port_processes() {
+    local port="$1"
+    log_info "Prozesse auf Port ${port} beenden (fuser)..."
+    fuser -k "${port}/tcp" 2>/dev/null || true
+    fuser -k "${port}/udp" 2>/dev/null || true
+    sleep 1
+}
+
+start_server() {
+    local name="$1"
+    local conf
+    conf=$(get_server_conf "$name")
+
+    if [[ ! -f "$conf" ]]; then
+        log_error "Server '${name}' nicht gefunden."
+        return 1
+    fi
+
+    source "$conf"
+
+    log_step "Server '${name}' starten..."
+
+    # Prozesse auf den Ports killen via fuser
+    kill_port_processes "$TCP_PORT"
+    if [[ "$TCP_PORT" != "$UDP_PORT" ]]; then
+        kill_port_processes "$UDP_PORT"
+    fi
+
+    # Screen-Session prüfen
+    if screen -ls | grep -q "fivem-${name}"; then
+        log_warn "Screen-Session 'fivem-${name}' läuft bereits. Stoppe zuerst..."
+        screen -S "fivem-${name}" -X quit 2>/dev/null || true
+        sleep 2
+    fi
+
+    # Via systemd starten
+    systemctl start "fivem-${name}.service"
+    sleep 3
+
+    if screen -ls | grep -q "fivem-${name}"; then
+        log_ok "Server '${name}' gestartet. (Port ${TCP_PORT})"
+    else
+        log_error "Server '${name}' konnte nicht gestartet werden. Prüfe Logs."
+    fi
+}
+
+stop_server() {
+    local name="$1"
+    local conf
+    conf=$(get_server_conf "$name")
+
+    if [[ ! -f "$conf" ]]; then
+        log_error "Server '${name}' nicht gefunden."
+        return 1
+    fi
+
+    log_step "Server '${name}' stoppen..."
+
+    # Screen-Session beenden
+    if screen -ls | grep -q "fivem-${name}"; then
+        screen -S "fivem-${name}" -X quit 2>/dev/null || true
+    fi
+
+    systemctl stop "fivem-${name}.service" 2>/dev/null || true
+
+    source "$conf"
+    kill_port_processes "$TCP_PORT"
+
+    log_ok "Server '${name}' gestoppt."
+}
+
+restart_server() {
+    local name="$1"
+    log_step "Server '${name}' neustarten..."
+    stop_server "$name"
+    sleep 3
+    start_server "$name"
+}
+
+server_console() {
+    local name="$1"
+
+    if ! screen -ls | grep -q "fivem-${name}"; then
+        log_error "Server '${name}' läuft nicht — keine Konsole verfügbar."
+        return 1
+    fi
+
+    echo ""
+    log_info "Verbinde mit Konsole von '${name}'..."
+    echo -e "${Y}Zum Verlassen: ${W}STRG+A${Y} dann ${W}D${Y} (Detach)${N}"
+    echo ""
+    sleep 2
+    screen -r "fivem-${name}"
+}
+
+server_status() {
+    local name="$1"
+    local conf
+    conf=$(get_server_conf "$name")
+
+    if [[ ! -f "$conf" ]]; then
+        log_error "Server '${name}' nicht gefunden."
+        return 1
+    fi
+
+    source "$conf"
+
+    local status_screen="GESTOPPT"
+    local status_service="inactive"
+    local status_color="$R"
+
+    if screen -ls | grep -q "fivem-${name}"; then
+        status_screen="LÄUFT"
+        status_color="$G"
+    fi
+
+    status_service=$(systemctl is-active "fivem-${name}.service" 2>/dev/null || echo "inactive")
+
+    echo -e "  ${W}${name}${N}"
+    echo -e "    Status:     ${status_color}${status_screen}${N} (systemd: ${status_service})"
+    echo -e "    Game Port:  ${TCP_PORT}/tcp, ${UDP_PORT}/udp"
+    echo -e "    txAdmin:    ${TXADMIN_PORT}"
+    echo -e "    RCON:       ${RCON_PASSWORD}"
+    echo -e "    Verzeichnis: ${SERVERS_DIR}/${name}"
+}
+
+start_all_servers() {
+    log_step "Alle Server starten..."
+    for name in $(list_server_names); do
+        start_server "$name"
+    done
+}
+
+stop_all_servers() {
+    log_step "Alle Server stoppen..."
+    for name in $(list_server_names); do
+        stop_server "$name"
+    done
+}
+
+restart_all_servers() {
+    log_step "Alle Server neustarten..."
+    for name in $(list_server_names); do
+        restart_server "$name"
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Server löschen
+# ═══════════════════════════════════════════════════════════════════════════════
+
+delete_server() {
+    local name="$1"
+    local conf
+    conf=$(get_server_conf "$name")
+
+    if [[ ! -f "$conf" ]]; then
+        log_error "Server '${name}' nicht gefunden."
+        return 1
+    fi
+
+    if ! confirm "Server '${name}' wirklich löschen? (Daten werden entfernt)"; then
+        log_info "Abgebrochen."
+        return 0
+    fi
+
+    source "$conf"
+
+    # Stoppen
+    stop_server "$name"
+
+    # Firewall-Regeln entfernen
+    ufw delete allow "${TCP_PORT}/tcp" 2>/dev/null || true
+    ufw delete allow "${UDP_PORT}/udp" 2>/dev/null || true
+    ufw delete allow "${TXADMIN_PORT}/tcp" 2>/dev/null || true
+
+    # Systemd-Service entfernen
+    systemctl disable "fivem-${name}.service" 2>/dev/null || true
+    rm -f "/etc/systemd/system/fivem-${name}.service"
+    systemctl daemon-reload
+
+    # Daten löschen
+    rm -rf "${SERVERS_DIR}/${name}"
+    rm -f "$conf"
+
+    local count
+    count=$(count_servers)
+    save_config_var "SERVER_COUNT" "$count"
+
+    log_ok "Server '${name}' vollständig gelöscht."
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FiveM Artifacts Update
+# ═══════════════════════════════════════════════════════════════════════════════
+
+update_artifacts() {
+    log_step "FiveM Artifacts auf neueste Recommended-Version aktualisieren..."
+
+    local api_response build_num download_url
+    api_response=$(curl -s "$VERSIONS_API")
+    build_num=$(echo "$api_response" | jq -r '.recommended')
+    download_url=$(echo "$api_response" | jq -r '.recommended_download')
+
+    source "$CONFIG_FILE"
+
+    if [[ "$ARTIFACT_BUILD" == "$build_num" ]]; then
+        log_ok "Bereits auf dem neuesten Recommended Build: ${build_num}"
+        return 0
+    fi
+
+    log_info "Aktueller Build: ${ARTIFACT_BUILD:-unbekannt}"
+    log_info "Neuer Build:     ${build_num}"
+
+    if ! confirm "Update durchführen?"; then
+        return 0
+    fi
+
+    # Alle Server stoppen
+    stop_all_servers
+
+    # Backup
+    if [[ -d "$ARTIFACTS_DIR" ]]; then
+        mv "$ARTIFACTS_DIR" "${ARTIFACTS_DIR}_backup_$(date +%Y%m%d_%H%M%S)"
+    fi
+
+    mkdir -p "$ARTIFACTS_DIR"
+
+    cd /tmp
+    wget -q --show-progress "$download_url" -O fx.tar.xz
+    tar xf fx.tar.xz -C "$ARTIFACTS_DIR"
+    rm -f fx.tar.xz
+
+    chmod +x "${ARTIFACTS_DIR}/run.sh" 2>/dev/null || true
+    find "$ARTIFACTS_DIR" -name "FXServer" -exec chmod +x {} \; 2>/dev/null || true
+    chown -R "${FIVEM_USER}:${FIVEM_USER}" "$ARTIFACTS_DIR"
+
+    save_config_var "ARTIFACT_BUILD" "$build_num"
+    save_config_var "ARTIFACT_URL" "$download_url"
+
+    log_ok "Artifacts auf Build ${build_num} aktualisiert."
+
+    if confirm "Alle Server jetzt neu starten?"; then
+        start_all_servers
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MariaDB Datenbank für Server erstellen
+# ═══════════════════════════════════════════════════════════════════════════════
+
+create_database() {
+    local db_name db_user db_pass
+
+    db_name=$(read_input "Datenbank-Name" "")
+    db_user=$(read_input "Datenbank-Benutzer" "")
+    db_pass=$(read_input "Datenbank-Passwort" "$(gen_password)")
+
+    if [[ -z "$db_name" || -z "$db_user" ]]; then
+        log_error "Name und Benutzer dürfen nicht leer sein."
+        return 1
+    fi
+
+    mysql -u root <<EOSQL
+CREATE DATABASE IF NOT EXISTS \`${db_name}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '${db_user}'@'%' IDENTIFIED BY '${db_pass}';
+GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'%';
+CREATE USER IF NOT EXISTS '${db_user}'@'localhost' IDENTIFIED BY '${db_pass}';
+GRANT ALL PRIVILEGES ON \`${db_name}\`.* TO '${db_user}'@'localhost';
+FLUSH PRIVILEGES;
+EOSQL
+
+    separator
+    log_ok "Datenbank erstellt!"
+    echo -e "  ${D}Datenbank:${N} ${db_name}"
+    echo -e "  ${D}Benutzer:${N}  ${db_user}"
+    echo -e "  ${D}Passwort:${N}  ${db_pass}"
+    echo -e "  ${D}Connection String:${N}"
+    echo -e "  ${W}mysql://${db_user}:${db_pass}@localhost/${db_name}?charset=utf8mb4${N}"
+    separator
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Menüsystem
+# ═══════════════════════════════════════════════════════════════════════════════
+
+select_server() {
+    local servers
+    servers=($(list_server_names))
+
+    if [[ ${#servers[@]} -eq 0 ]]; then
+        log_warn "Keine Server vorhanden."
+        return 1
+    fi
+
+    echo ""
+    echo -e "${W}Verfügbare Server:${N}"
+    local i=1
+    for srv in "${servers[@]}"; do
+        local running="${R}⬤ GESTOPPT${N}"
+        if screen -ls 2>/dev/null | grep -q "fivem-${srv}"; then
+            running="${G}⬤ LÄUFT${N}"
+        fi
+        echo -e "  ${C}${i})${N} ${srv}  ${running}"
+        ((i++))
+    done
+    echo ""
+
+    local choice
+    choice=$(read_input "Server-Nummer wählen" "1")
+
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 || "$choice" -gt ${#servers[@]} ]]; then
+        log_error "Ungültige Auswahl."
+        return 1
+    fi
+
+    SELECTED_SERVER="${servers[$((choice-1))]}"
+    return 0
+}
+
+menu_manage_server() {
+    while true; do
+        if ! select_server; then
+            return
+        fi
+
+        local name="$SELECTED_SERVER"
+        separator
+        server_status "$name"
+        separator
+
+        echo ""
+        echo -e "  ${C}1)${N} Starten"
+        echo -e "  ${C}2)${N} Stoppen"
+        echo -e "  ${C}3)${N} Neustarten"
+        echo -e "  ${C}4)${N} Live-Konsole"
+        echo -e "  ${C}5)${N} Status"
+        echo -e "  ${C}6)${N} server.cfg bearbeiten"
+        echo -e "  ${C}7)${N} Server löschen"
+        echo -e "  ${C}0)${N} Zurück"
+        echo ""
+
+        local action
+        action=$(read_input "Aktion" "0")
+
+        case "$action" in
+            1) start_server "$name" ;;
+            2) stop_server "$name" ;;
+            3) restart_server "$name" ;;
+            4) server_console "$name" ;;
+            5) server_status "$name" ;;
+            6)
+                local editor="${EDITOR:-nano}"
+                "$editor" "${SERVERS_DIR}/${name}/server.cfg"
+                log_ok "server.cfg gespeichert. Neustart nötig für Änderungen."
+                ;;
+            7)
+                delete_server "$name"
+                return
+                ;;
+            0) return ;;
+            *) log_error "Ungültige Eingabe." ;;
+        esac
+
+        echo ""
+        echo -en "${D}Weiter mit Enter...${N}"
+        read -r
+    done
+}
+
+menu_show_all() {
+    separator
+    echo -e "${W}Alle Server:${N}"
+    separator
+
+    local servers
+    servers=($(list_server_names))
+
+    if [[ ${#servers[@]} -eq 0 ]]; then
+        log_warn "Keine Server vorhanden."
+        return
+    fi
+
+    for srv in "${servers[@]}"; do
+        server_status "$srv"
+        echo ""
+    done
+
+    separator
+}
+
+menu_mass_action() {
+    echo ""
+    echo -e "  ${C}1)${N} Alle Server starten"
+    echo -e "  ${C}2)${N} Alle Server stoppen"
+    echo -e "  ${C}3)${N} Alle Server neustarten"
+    echo -e "  ${C}0)${N} Zurück"
+    echo ""
+
+    local choice
+    choice=$(read_input "Aktion" "0")
+
+    case "$choice" in
+        1) start_all_servers ;;
+        2) stop_all_servers ;;
+        3) restart_all_servers ;;
+        0) return ;;
+        *) log_error "Ungültige Eingabe." ;;
+    esac
+}
+
+menu_database() {
+    echo ""
+    echo -e "  ${C}1)${N} Neue Datenbank + Benutzer erstellen"
+    echo -e "  ${C}2)${N} Alle Datenbanken anzeigen"
+    echo -e "  ${C}3)${N} MariaDB Status"
+    echo -e "  ${C}0)${N} Zurück"
+    echo ""
+
+    local choice
+    choice=$(read_input "Aktion" "0")
+
+    case "$choice" in
+        1) create_database ;;
+        2) mysql -u root -e "SHOW DATABASES;" ;;
+        3) systemctl status mariadb --no-pager ;;
+        0) return ;;
+        *) log_error "Ungültige Eingabe." ;;
+    esac
+}
+
+menu_firewall() {
+    echo ""
+    echo -e "  ${C}1)${N} Firewall Status anzeigen"
+    echo -e "  ${C}2)${N} Alle Regeln anzeigen"
+    echo -e "  ${C}3)${N} Port manuell öffnen"
+    echo -e "  ${C}4)${N} Port manuell schließen"
+    echo -e "  ${C}0)${N} Zurück"
+    echo ""
+
+    local choice
+    choice=$(read_input "Aktion" "0")
+
+    case "$choice" in
+        1) ufw status verbose ;;
+        2) ufw status numbered ;;
+        3)
+            local port protocol
+            port=$(read_input "Port" "")
+            protocol=$(read_input "Protokoll (tcp/udp/both)" "both")
+            if [[ -n "$port" ]]; then
+                if [[ "$protocol" == "both" ]]; then
+                    ufw allow "${port}/tcp"
+                    ufw allow "${port}/udp"
+                else
+                    ufw allow "${port}/${protocol}"
+                fi
+                ufw reload
+                log_ok "Port ${port}/${protocol} geöffnet."
             fi
-            mariadb -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'${HOST_SPEC}' IDENTIFIED BY '${ESCAPED_DB_PASS}';"
-            mariadb -e "GRANT ALL PRIVILEGES ON *.* TO '${DB_USER}'@'${HOST_SPEC}' WITH GRANT OPTION;"
-            mariadb -e "FLUSH PRIVILEGES;"
-        fi
-    fi
-
-    # phpMyAdmin
-    if [[ "$INSTALL_PMA" =~ ^[Yy]$ ]]; then
-        setup_phpmyadmin
-    fi
-
-    # FiveM Artefakte downloaden
-    status "Lade FiveM Artefakte"
-    id -u fivem &>/dev/null || useradd -r -m -d /home/fivem -s /bin/bash fivem
-    mkdir -p /home/fivem/artifacts
-    cd /home/fivem/artifacts || exit 1
-    LATEST_LINK=$(curl -s https://runtime.fivem.net/artifacts/fivem/build_proot_linux/master/ | grep -oP 'href="\./\K[0-9]+-[a-f0-9]+/fx\.tar\.xz' | tail -n 1)
-    wget -q https://runtime.fivem.net/artifacts/fivem/build_proot_linux/master/$LATEST_LINK -O fx.tar.xz
-    tar -xf fx.tar.xz && rm fx.tar.xz
-    chmod -R +x /home/fivem/artifacts
-
-    cat << 'EOF' > /home/fivem/start_all.sh
-#!/bin/bash
-EOF
-    cat << 'EOF' > /home/fivem/stop_all.sh
-#!/bin/bash
-EOF
-    chmod +x /home/fivem/start_all.sh /home/fivem/stop_all.sh
-
-    # Server anlegen
-    for ((i=0; i<SERVER_COUNT; i++)); do
-        add_single_server "${SERVER_NAMES[$i]}" "${TX_PORTS[$i]}" "${GAME_PORTS[$i]}"
-        echo "/home/fivem/${SERVER_NAMES[$i]}/start_${SERVER_NAMES[$i]}.sh" >> /home/fivem/start_all.sh
-        echo "/home/fivem/${SERVER_NAMES[$i]}/stop_${SERVER_NAMES[$i]}.sh" >> /home/fivem/stop_all.sh
-    done
-
-    chown -R fivem:fivem /home/fivem
-
-    # Firewall
-    ufw allow ${SSH_PORT}/tcp comment 'SSH Port' >/dev/null 2>&1
-    if [[ "$INSTALL_MARIADB" =~ ^[Yy]$ ]]; then
-        if [ "$DB_ACCESS_CHOICE" == "2" ]; then
-            ufw allow 3306/tcp comment 'MariaDB Global' >/dev/null 2>&1
-        elif [ "$DB_ACCESS_CHOICE" == "3" ]; then
-            ufw allow from ${ALLOWED_DB_IP} to any port 3306 proto tcp comment 'MariaDB Restricted' >/dev/null 2>&1
-        fi
-    fi
-    echo "y" | ufw enable >/dev/null 2>&1
-
-    IP=$(get_server_ip)
-    clear
-    echo -e "${green}${bold}====================================================${reset}"
-    echo -e "${green}${bold}         ERSTINSTALLATION ABGESCHLOSSEN!           ${reset}"
-    echo -e "${green}${bold}====================================================${reset}"
-    echo -e "Server IP: ${blue}${IP}${reset}"
-    if [[ "$INSTALL_PMA" =~ ^[Yy]$ ]]; then
-        echo -e "phpMyAdmin: ${blue}http://${IP}/phpmyadmin${reset}"
-    fi
-    echo ""
+            ;;
+        4)
+            local port protocol
+            port=$(read_input "Port" "")
+            protocol=$(read_input "Protokoll (tcp/udp/both)" "both")
+            if [[ -n "$port" ]]; then
+                if [[ "$protocol" == "both" ]]; then
+                    ufw delete allow "${port}/tcp" 2>/dev/null || true
+                    ufw delete allow "${port}/udp" 2>/dev/null || true
+                else
+                    ufw delete allow "${port}/${protocol}" 2>/dev/null || true
+                fi
+                ufw reload
+                log_ok "Port ${port}/${protocol} geschlossen."
+            fi
+            ;;
+        0) return ;;
+        *) log_error "Ungültige Eingabe." ;;
+    esac
 }
 
-# --- SERVER VERWALTUNGSMENU ---
-manage_servers_menu(){
-    clear
-    echo -e "${cyan}${bold}--- Server Verwaltung ---${reset}"
-    echo -e "Vorhandene Server:"
-    SERVERS=($(find /home/fivem/ -maxdepth 1 -type d -mindepth 1 ! -name "artifacts" ! -name "scripts" -exec basename {} \; 2>/dev/null))
-    
-    if [ ${#SERVERS[@]} -eq 0 ]; then
-        echo -e "${red}Keine Server gefunden!${reset}"
-        read -r -p "Taste drücken zum Fortfahren..."
-        return
-    fi
-
-    for idx in "${!SERVERS[@]}"; do
-        S="${SERVERS[$idx]}"
-        RUNNING="Gestoppt"
-        screen -ls 2>/dev/null | grep -v "Dead" | grep -q "\.${S}\s" && RUNNING="LÄUFT"
-        echo -e "  $((idx+1))) ${bold}${S}${reset} [ Status: ${cyan}${RUNNING}${reset} ]"
-    done
+menu_extras() {
     echo ""
-    read -r -p "Wähle einen Server [1-${#SERVERS[@]}]: " SEL
-    if ! [[ "$SEL" =~ ^[0-9]+$ ]] || [ "$SEL" -lt 1 ] || [ "$SEL" -gt ${#SERVERS[@]} ]; then
-        return
-    fi
+    echo -e "  ${C}1)${N} FiveM Artifacts aktualisieren"
+    echo -e "  ${C}2)${N} Nginx Status / Neustart"
+    echo -e "  ${C}3)${N} MariaDB Status / Neustart"
+    echo -e "  ${C}4)${N} System-Info"
+    echo -e "  ${C}5)${N} Alle Screen-Sessions anzeigen"
+    echo -e "  ${C}0)${N} Zurück"
+    echo ""
 
-    CHOSEN="${SERVERS[$((SEL-1))]}"
-    echo -e "\nAktion für '${CHOSEN}':"
-    echo -e "  1) Starten (Kills Ports & öffnet Live-Konsole)"
-    echo -e "  2) Stoppen"
-    echo -e "  3) Neustarten"
-    echo -e "  4) Live-Konsole / Screen öffnen (Attach)"
-    echo -e "  5) txAdmin PIN / Code anzeigen"
-    read -r -p "Auswahl [1-5]: " ACT
+    local choice
+    choice=$(read_input "Aktion" "0")
 
-    case $ACT in
-        1) runuser -u fivem -- "/home/fivem/${CHOSEN}/start_${CHOSEN}.sh" ;;
-        2) runuser -u fivem -- "/home/fivem/${CHOSEN}/stop_${CHOSEN}.sh" ;;
-        3) runuser -u fivem -- "/home/fivem/${CHOSEN}/restart_${CHOSEN}.sh" ;;
-        4) runuser -u fivem -- "/home/fivem/${CHOSEN}/console_${CHOSEN}.sh" ;;
-        5) runuser -u fivem -- "/home/fivem/${CHOSEN}/pin_${CHOSEN}.sh" ;;
+    case "$choice" in
+        1) update_artifacts ;;
+        2)
+            systemctl status nginx --no-pager
+            if confirm "Nginx neustarten?"; then
+                systemctl restart nginx
+                log_ok "Nginx neugestartet."
+            fi
+            ;;
+        3)
+            systemctl status mariadb --no-pager
+            if confirm "MariaDB neustarten?"; then
+                systemctl restart mariadb
+                log_ok "MariaDB neugestartet."
+            fi
+            ;;
+        4)
+            echo ""
+            echo -e "  ${D}Hostname:${N}     $(hostname)"
+            echo -e "  ${D}IP:${N}           $(hostname -I | awk '{print $1}')"
+            echo -e "  ${D}Kernel:${N}       $(uname -r)"
+            echo -e "  ${D}Uptime:${N}       $(uptime -p)"
+            echo -e "  ${D}RAM:${N}          $(free -h | awk '/Mem:/{print $3"/"$2}')"
+            echo -e "  ${D}Disk:${N}         $(df -h / | awk 'NR==2{print $3"/"$2" ("$5" belegt)"}')"
+            echo -e "  ${D}FiveM Build:${N}  $(grep '^ARTIFACT_BUILD=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2)"
+            echo -e "  ${D}Server:${N}       $(count_servers) konfiguriert"
+            echo ""
+            ;;
+        5) screen -ls ;;
+        0) return ;;
+        *) log_error "Ungültige Eingabe." ;;
     esac
-    echo ""
-    read -r -p "Taste drücken zum Fortfahren..."
 }
 
-# --- MAIN MENU ---
-while true; do
-    clear
-    echo -e "${blue}${bold}====================================================${reset}"
-    echo -e "${cyan}${bold}   FiveM & MariaDB Manager Wizard (Debian 12)       ${reset}"
-    echo -e "${blue}${bold}====================================================${reset}"
-    echo -e "  ${cyan}1)${reset} Erstinstallation (MariaDB, phpMyAdmin, Base-Setup)"
-    echo -e "  ${cyan}2)${reset} Neuen FiveM-Server hinzufügen"
-    echo -e "  ${cyan}3)${reset} Server verwalten (Start, Stop, Live-Konsole, PIN)"
-    echo -e "  ${cyan}4)${reset} phpMyAdmin nachinstallieren"
-    echo -e "  ${cyan}5)${reset} ${red}${bold}ALLES LÖSCHEN (Full Purge / Deinstallation)${reset}"
-    echo -e "  ${cyan}0)${reset} Beenden"
-    echo -e "${blue}${bold}====================================================${reset}"
-    read -r -p "$(echo -e "${yellow}Auswahl [0-5]: ${reset}")" CHOICE
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Erstinstallation
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    case $CHOICE in
-        1) full_installation ;;
-        2) menu_add_server ;;
-        3) manage_servers_menu ;;
-        4) setup_phpmyadmin ;;
-        5) purge_everything ;;
-        0) exit 0 ;;
-        *) echo -e "${red}Ungültige Auswahl!${reset}" ; sleep 1 ;;
+initial_setup() {
+    banner
+    echo -e "${W}Erstinstallation starten${N}"
+    separator
+
+    # Benutzer-Eingaben sammeln
+    local sys_user sys_pass db_user db_pass server_count base_port base_txport
+
+    sys_user=$(read_input "System-Benutzername für FiveM" "$FIVEM_USER")
+    sys_pass=$(read_input "System-Passwort" "$(gen_password)")
+    db_user=$(read_input "MariaDB Admin-Benutzername" "fivem_admin")
+    db_pass=$(read_input "MariaDB Admin-Passwort" "$(gen_password)")
+    server_count=$(read_input "Anzahl FiveM-Server" "1")
+    base_port=$(read_input "Basis-Game-Port" "30120")
+    base_txport=$(read_input "Basis-txAdmin-Port" "40120")
+
+    FIVEM_USER="$sys_user"
+    save_config_var "FIVEM_USER" "$FIVEM_USER"
+
+    separator
+    echo -e "${W}Zusammenfassung:${N}"
+    echo -e "  ${D}System-User:${N}     ${sys_user}"
+    echo -e "  ${D}System-Passwort:${N} ${sys_pass}"
+    echo -e "  ${D}DB-User:${N}         ${db_user}"
+    echo -e "  ${D}DB-Passwort:${N}     ${db_pass}"
+    echo -e "  ${D}Server:${N}          ${server_count}"
+    echo -e "  ${D}Ports:${N}           ${base_port}+ / txAdmin: ${base_txport}+"
+    separator
+
+    if ! confirm "Installation starten?"; then
+        log_info "Abgebrochen."
+        exit 0
+    fi
+
+    echo ""
+    log_step "Installation wird durchgeführt..."
+    echo ""
+
+    # 1. Abhängigkeiten
+    install_dependencies
+
+    # 2. System-Benutzer
+    create_system_user "$sys_user" "$sys_pass"
+
+    # 3. Nginx
+    install_nginx
+
+    # 4. MariaDB
+    install_mariadb
+    setup_mariadb_user "$db_user" "$db_pass"
+
+    # 5. phpMyAdmin
+    install_phpmyadmin
+
+    # 6. FiveM Artifacts
+    download_fivem_artifacts
+
+    # 7. Firewall
+    setup_firewall
+
+    # 8. Server erstellen
+    for ((i=1; i<=server_count; i++)); do
+        local srv_name="server${i}"
+        local srv_tcp=$((base_port + i - 1))
+        local srv_udp=$srv_tcp
+        local srv_txadmin=$((base_txport + i - 1))
+        local srv_rcon
+        srv_rcon=$(gen_password)
+        local server_dir="${SERVERS_DIR}/${srv_name}"
+
+        log_step "Server ${i}/${server_count}: '${srv_name}' (Port ${srv_tcp})..."
+
+        mkdir -p "${server_dir}/resources" "${server_dir}/cache" "${server_dir}/data"
+
+        cat > "${server_dir}/server.cfg" <<EOCFG
+endpoint_add_tcp "0.0.0.0:${srv_tcp}"
+endpoint_add_udp "0.0.0.0:${srv_udp}"
+sv_hostname "${srv_name} — FiveM Server"
+sv_maxclients 48
+sets sv_projectName "${srv_name}"
+sets sv_projectDesc "FiveM Server managed by FiveM Server Manager"
+sets locale "de-DE"
+sets tags "default"
+rcon_password "${srv_rcon}"
+sv_endpointprivacy true
+sv_scriptHookAllowed 0
+# sv_licenseKey "DEIN_LIZENZ_KEY"
+ensure mapmanager
+ensure chat
+ensure spawnmanager
+ensure sessionmanager
+ensure basic-gamemode
+ensure hardcap
+ensure rconlog
+set onesync on
+EOCFG
+
+        cat > "${server_dir}/start.sh" <<EOSTART
+#!/bin/bash
+cd "${server_dir}"
+exec ${ARTIFACTS_DIR}/run.sh +exec server.cfg
+EOSTART
+        chmod +x "${server_dir}/start.sh"
+
+        cat > "/etc/systemd/system/fivem-${srv_name}.service" <<EOSERVICE
+[Unit]
+Description=FiveM Server — ${srv_name}
+After=network.target mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=${FIVEM_USER}
+Group=${FIVEM_USER}
+WorkingDirectory=${server_dir}
+ExecStartPre=/bin/bash -c 'fuser -k ${srv_tcp}/tcp ${srv_udp}/udp 2>/dev/null || true'
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/bin/screen -dmS fivem-${srv_name} ${server_dir}/start.sh
+ExecStop=/usr/bin/screen -S fivem-${srv_name} -X quit
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOSERVICE
+
+        chown -R "${FIVEM_USER}:${FIVEM_USER}" "${server_dir}"
+        open_server_ports "$srv_name" "$srv_tcp" "$srv_udp" "$srv_txadmin"
+        save_server_conf "$srv_name" "$srv_tcp" "$srv_udp" "$srv_txadmin" "$srv_rcon"
+    done
+
+    systemctl daemon-reload
+    save_config_var "INSTALLED" "1"
+    save_config_var "SERVER_COUNT" "$server_count"
+
+    # Zusammenfassung
+    banner
+    echo -e "${G}═══════════════════════════════════════════════════════════${N}"
+    echo -e "${G}  Installation abgeschlossen!${N}"
+    echo -e "${G}═══════════════════════════════════════════════════════════${N}"
+    echo ""
+    echo -e "  ${W}System-Benutzer:${N}  ${sys_user} / ${sys_pass}"
+    echo -e "  ${W}MariaDB:${N}          ${db_user} / ${db_pass}"
+    echo -e "  ${W}phpMyAdmin:${N}       http://$(hostname -I | awk '{print $1}'):8080"
+    echo -e "  ${W}FiveM Build:${N}      $(grep '^ARTIFACT_BUILD=' "$CONFIG_FILE" | cut -d= -f2)"
+    echo ""
+    echo -e "  ${W}Server:${N}"
+    for ((i=1; i<=server_count; i++)); do
+        local srv_name="server${i}"
+        source "$(get_server_conf "$srv_name")"
+        echo -e "    ${C}${srv_name}${N} — Port ${TCP_PORT}, txAdmin ${TXADMIN_PORT}, RCON: ${RCON_PASSWORD}"
+    done
+    echo ""
+    echo -e "  ${W}Befehle:${N}"
+    echo -e "    ${D}Starten:${N}     systemctl start fivem-<name>"
+    echo -e "    ${D}Stoppen:${N}     systemctl stop fivem-<name>"
+    echo -e "    ${D}Neustarten:${N}  systemctl restart fivem-<name>"
+    echo -e "    ${D}Konsole:${N}     screen -r fivem-<name>"
+    echo -e "    ${D}Manager:${N}     bash $(readlink -f "$0")"
+    echo ""
+    separator
+
+    echo ""
+    if confirm "Server jetzt starten?"; then
+        start_all_servers
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Hauptmenü
+# ═══════════════════════════════════════════════════════════════════════════════
+
+main_menu() {
+    while true; do
+        banner
+        source "$CONFIG_FILE" 2>/dev/null || true
+
+        local srv_count
+        srv_count=$(count_servers)
+
+        echo -e "  ${D}FiveM Build:${N}  ${ARTIFACT_BUILD:-nicht installiert}"
+        echo -e "  ${D}Server:${N}       ${srv_count} konfiguriert"
+        echo -e "  ${D}Benutzer:${N}     ${FIVEM_USER}"
+        echo ""
+        separator
+        echo ""
+        echo -e "  ${C}1)${N}  ${W}Einzelnen Server verwalten${N}      (Start/Stop/Konsole/...)"
+        echo -e "  ${C}2)${N}  ${W}Alle Server anzeigen${N}"
+        echo -e "  ${C}3)${N}  ${W}Masse-Aktion${N}                    (Alle starten/stoppen)"
+        echo -e "  ${C}4)${N}  ${W}Neuen Server erstellen${N}"
+        echo -e "  ${C}5)${N}  ${W}Mehrere Server auf einmal erstellen${N}"
+        echo ""
+        separator
+        echo ""
+        echo -e "  ${C}6)${N}  ${W}Datenbank verwalten${N}"
+        echo -e "  ${C}7)${N}  ${W}Firewall verwalten${N}"
+        echo -e "  ${C}8)${N}  ${W}Extras${N}                          (Update/Nginx/System)"
+        echo ""
+        separator
+        echo ""
+        echo -e "  ${C}9)${N}  ${W}Erstinstallation${N}                (Nginx/MariaDB/phpMyAdmin/FiveM)"
+        echo -e "  ${C}0)${N}  ${W}Beenden${N}"
+        echo ""
+
+        local choice
+        choice=$(read_input "Auswahl" "0")
+
+        case "$choice" in
+            1) menu_manage_server ;;
+            2) menu_show_all ;;
+            3) menu_mass_action ;;
+            4) create_server ;;
+            5) create_multiple_servers ;;
+            6) menu_database ;;
+            7) menu_firewall ;;
+            8) menu_extras ;;
+            9) initial_setup ;;
+            0)
+                echo ""
+                log_info "Beendet."
+                exit 0
+                ;;
+            *) log_error "Ungültige Eingabe." ;;
+        esac
+
+        echo ""
+        echo -en "${D}Weiter mit Enter...${N}"
+        read -r
+    done
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Einstiegspunkt
+# ═══════════════════════════════════════════════════════════════════════════════
+
+main() {
+    check_root
+    init_config
+
+    # Wenn als Argument ein Befehl übergeben wird — Direktmodus
+    case "${1:-}" in
+        install)
+            initial_setup
+            ;;
+        start)
+            if [[ -n "${2:-}" ]]; then
+                start_server "$2"
+            else
+                start_all_servers
+            fi
+            ;;
+        stop)
+            if [[ -n "${2:-}" ]]; then
+                stop_server "$2"
+            else
+                stop_all_servers
+            fi
+            ;;
+        restart)
+            if [[ -n "${2:-}" ]]; then
+                restart_server "$2"
+            else
+                restart_all_servers
+            fi
+            ;;
+        console)
+            if [[ -n "${2:-}" ]]; then
+                server_console "$2"
+            else
+                log_error "Benutzung: $0 console <servername>"
+            fi
+            ;;
+        status)
+            if [[ -n "${2:-}" ]]; then
+                server_status "$2"
+            else
+                menu_show_all
+            fi
+            ;;
+        create)
+            create_server
+            ;;
+        delete)
+            if [[ -n "${2:-}" ]]; then
+                delete_server "$2"
+            else
+                log_error "Benutzung: $0 delete <servername>"
+            fi
+            ;;
+        update)
+            update_artifacts
+            ;;
+        help|--help|-h)
+            echo ""
+            echo "Benutzung: $0 [befehl] [servername]"
+            echo ""
+            echo "Befehle:"
+            echo "  install              Erstinstallation"
+            echo "  start [name]         Server starten (alle wenn kein Name)"
+            echo "  stop [name]          Server stoppen (alle wenn kein Name)"
+            echo "  restart [name]       Server neustarten (alle wenn kein Name)"
+            echo "  console <name>       Live-Konsole öffnen"
+            echo "  status [name]        Status anzeigen"
+            echo "  create               Neuen Server erstellen"
+            echo "  delete <name>        Server löschen"
+            echo "  update               FiveM Artifacts aktualisieren"
+            echo "  help                 Diese Hilfe"
+            echo ""
+            echo "Ohne Argumente wird das interaktive Menü gestartet."
+            echo ""
+            ;;
+        "")
+            main_menu
+            ;;
+        *)
+            log_error "Unbekannter Befehl: $1"
+            echo "Nutze '$0 help' für Hilfe."
+            exit 1
+            ;;
     esac
-done
+}
+
+main "$@"
