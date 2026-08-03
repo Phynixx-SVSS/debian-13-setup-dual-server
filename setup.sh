@@ -53,9 +53,10 @@ add_single_server(){
     START_SCRIPT="${S_DIR}/start_${S_NAME}.sh"
     STOP_SCRIPT="${S_DIR}/stop_${S_NAME}.sh"
     RESTART_SCRIPT="${S_DIR}/restart_${S_NAME}.sh"
+    CONSOLE_SCRIPT="${S_DIR}/console_${S_NAME}.sh"
     PIN_SCRIPT="${S_DIR}/pin_${S_NAME}.sh"
 
-    # Start Skript mit Log-Erfassung für txAdmin PIN
+    # Start Skript
     cat << EOF > "$START_SCRIPT"
 #!/bin/bash
 if screen -list | grep -q "\.${S_NAME}\s"; then
@@ -66,15 +67,16 @@ echo "Starte FiveM Server '${S_NAME}' auf txAdmin Port ${TX_PORT}..."
 cd ${S_DIR}/data || exit 1
 screen -L -Logfile ${S_DIR}/txadmin.log -dmS ${S_NAME} /home/fivem/artifacts/run.sh +set txAdminPort ${TX_PORT} +set txAdminServerProfile ${S_NAME}
 echo "Server '${S_NAME}' gestartet."
-echo "Warte auf txAdmin PIN..."
-sleep 3
+echo ""
+echo -e "\e[1m\e[93mTipp:\e[0m Zum Einsehen der Live-Konsole führe aus:"
+echo -e "  \e[96m/home/fivem/console_${S_NAME}.sh\e[0m  (oder \e[96mscreen -r ${S_NAME}\e[0m)"
+echo ""
+sleep 2
 PIN=\$(grep -oP 'PIN:\s*\K[0-9]{4}' ${S_DIR}/txadmin.log 2>/dev/null | tail -n 1)
 if [ -n "\$PIN" ]; then
     echo -e "\e[1m\e[92m====================================\e[0m"
     echo -e "\e[1m\e[92m  txAdmin Setup PIN: \e[93m\$PIN\e[0m"
     echo -e "\e[1m\e[92m====================================\e[0m"
-else
-    echo "PIN konnte noch nicht gelesen werden. Nutze '${S_DIR}/pin_${S_NAME}.sh' nach 5 Sekunden."
 fi
 EOF
 
@@ -100,6 +102,19 @@ sleep 2
 ${START_SCRIPT}
 EOF
 
+    # Live-Konsole / Screen Attach Skript
+    cat << EOF > "$CONSOLE_SCRIPT"
+#!/bin/bash
+if ! screen -list | grep -q "\.${S_NAME}\s"; then
+    echo "Server '${S_NAME}' läuft derzeit nicht."
+    exit 1
+fi
+echo -e "\e[1m\e[92mVerbinde mit Live-Konsole von '${S_NAME}'...\e[0m"
+echo -e "\e[1m\e[93mHINWEIS: Zum Verlassen der Konsole drücken: STRG + A, danach D\e[0m"
+sleep 2
+screen -r ${S_NAME} || screen -x ${S_NAME}
+EOF
+
     # PIN Skript
     cat << EOF > "$PIN_SCRIPT"
 #!/bin/bash
@@ -108,19 +123,20 @@ if [ -f "${S_DIR}/txadmin.log" ]; then
     if [ -n "\$PIN" ]; then
         echo -e "\e[1m\e[92mtxAdmin PIN für ${S_NAME}: \e[93m\$PIN\e[0m"
     else
-        echo "Kein PIN in ${S_DIR}/txadmin.log gefunden (Server eventuell bereits eingerichtet)."
+        echo "Kein PIN im Log gefunden. Öffne die Konsole via /home/fivem/console_${S_NAME}.sh"
     fi
 else
-    echo "Logdatei ${S_DIR}/txadmin.log existiert nicht. Starte den Server zuerst."
+    echo "Logdatei existiert nicht. Starte den Server zuerst."
 fi
 EOF
 
-    chmod +x "$START_SCRIPT" "$STOP_SCRIPT" "$RESTART_SCRIPT" "$PIN_SCRIPT"
+    chmod +x "$START_SCRIPT" "$STOP_SCRIPT" "$RESTART_SCRIPT" "$CONSOLE_SCRIPT" "$PIN_SCRIPT"
 
     # Symlinks in /home/fivem
     ln -sf "$START_SCRIPT" "/home/fivem/start_${S_NAME}.sh"
     ln -sf "$STOP_SCRIPT" "/home/fivem/stop_${S_NAME}.sh"
     ln -sf "$RESTART_SCRIPT" "/home/fivem/restart_${S_NAME}.sh"
+    ln -sf "$CONSOLE_SCRIPT" "/home/fivem/console_${S_NAME}.sh"
     ln -sf "$PIN_SCRIPT" "/home/fivem/pin_${S_NAME}.sh"
 
     # Firewall Ports
@@ -218,7 +234,6 @@ menu_add_server(){
         return
     fi
 
-    # Automatischer Vorschlag für Ports
     EXISTING_COUNT=$(find /home/fivem/ -maxdepth 1 -type d -name "server*" 2>/dev/null | wc -l)
     DEFAULT_TX=$((40120 + EXISTING_COUNT))
     DEFAULT_GAME=$((30120 + EXISTING_COUNT * 5))
@@ -231,16 +246,15 @@ menu_add_server(){
 
     add_single_server "$S_NAME" "$TX_PORT" "$GAME_PORT"
 
-    # Zu start_all / stop_all hinzufügen
     echo "/home/fivem/${S_NAME}/start_${S_NAME}.sh" >> /home/fivem/start_all.sh 2>/dev/null
     echo "/home/fivem/${S_NAME}/stop_${S_NAME}.sh" >> /home/fivem/stop_all.sh 2>/dev/null
 
     IP=$(get_server_ip)
     echo -e "\n${green}${bold}Server '${S_NAME}' erfolgreich hinzugefügt!${reset}"
-    echo -e "  Starten:   ${yellow}su - fivem -c '/home/fivem/start_${S_NAME}.sh'${reset}"
-    echo -e "  Stoppen:   ${yellow}su - fivem -c '/home/fivem/stop_${S_NAME}.sh'${reset}"
-    echo -e "  txAdmin:   ${blue}http://${IP}:${TX_PORT}${reset}"
-    echo -e "  Game Port: ${blue}${GAME_PORT}${reset}"
+    echo -e "  Starten:      ${yellow}su - fivem -c '/home/fivem/start_${S_NAME}.sh'${reset}"
+    echo -e "  Live-Konsole: ${yellow}su - fivem -c '/home/fivem/console_${S_NAME}.sh'${reset}"
+    echo -e "  Stoppen:      ${yellow}su - fivem -c '/home/fivem/stop_${S_NAME}.sh'${reset}"
+    echo -e "  txAdmin:      ${blue}http://${IP}:${TX_PORT}${reset}"
 }
 
 # --- ERSTINSTALLATION ---
@@ -290,7 +304,7 @@ full_installation(){
     SERVER_COUNT=${SERVER_COUNT:-1}
 
     declare -a SERVER_NAMES
-    declare -a TXADMIN_PORTS
+    declare -a TX_PORTS
     declare -a GAME_PORTS
 
     for ((i=1; i<=SERVER_COUNT; i++)); do
@@ -328,7 +342,6 @@ full_installation(){
         done
         systemctl restart mariadb
 
-        # WICHTIG: Nur DB-User anlegen, KEINE automatischen Datenbanken erstellen
         if [ "$DB_ACCESS_CHOICE" != "1" ]; then
             ESCAPED_DB_PASS=$(printf '%s' "$DB_PASS" | sed "s/'/''/g")
             HOST_SPEC="%"
@@ -396,7 +409,7 @@ EOF
 # --- SERVER VERWALTUNGSMENU ---
 manage_servers_menu(){
     clear
-    echo -e "${cyan}${bold}--- Server Verwaltung & txAdmin PIN ---${reset}"
+    echo -e "${cyan}${bold}--- Server Verwaltung ---${reset}"
     echo -e "Vorhandene Server:"
     SERVERS=($(find /home/fivem/ -maxdepth 1 -type d -mindepth 1 ! -name "artifacts" ! -name "scripts" -exec basename {} \; 2>/dev/null))
     
@@ -423,14 +436,16 @@ manage_servers_menu(){
     echo -e "  1) Starten"
     echo -e "  2) Stoppen"
     echo -e "  3) Neustarten"
-    echo -e "  4) txAdmin PIN / Code anzeigen"
-    read -r -p "Auswahl [1-4]: " ACT
+    echo -e "  4) Live-Konsole / Screen öffnen (Attach)"
+    echo -e "  5) txAdmin PIN / Code anzeigen"
+    read -r -p "Auswahl [1-5]: " ACT
 
     case $ACT in
         1) su - fivem -c "/home/fivem/${CHOSEN}/start_${CHOSEN}.sh" ;;
         2) su - fivem -c "/home/fivem/${CHOSEN}/stop_${CHOSEN}.sh" ;;
         3) su - fivem -c "/home/fivem/${CHOSEN}/restart_${CHOSEN}.sh" ;;
-        4) su - fivem -c "/home/fivem/${CHOSEN}/pin_${CHOSEN}.sh" ;;
+        4) su - fivem -c "/home/fivem/${CHOSEN}/console_${CHOSEN}.sh" ;;
+        5) su - fivem -c "/home/fivem/${CHOSEN}/pin_${CHOSEN}.sh" ;;
     esac
     echo ""
     read -r -p "Taste drücken zum Fortfahren..."
@@ -444,7 +459,7 @@ while true; do
     echo -e "${blue}${bold}====================================================${reset}"
     echo -e "  ${cyan}1)${reset} Erstinstallation (MariaDB, phpMyAdmin, Base-Setup)"
     echo -e "  ${cyan}2)${reset} Neuen FiveM-Server hinzufügen"
-    echo -e "  ${cyan}3)${reset} Server verwalten & txAdmin PIN anzeigen"
+    echo -e "  ${cyan}3)${reset} Server verwalten (Start, Stop, Live-Konsole, PIN)"
     echo -e "  ${cyan}4)${reset} phpMyAdmin nachinstallieren"
     echo -e "  ${cyan}5)${reset} ${red}${bold}ALLES LÖSCHEN (Full Purge / Deinstallation)${reset}"
     echo -e "  ${cyan}0)${reset} Beenden"
