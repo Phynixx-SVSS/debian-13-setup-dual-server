@@ -64,9 +64,9 @@ read_input() {
     local default="${2:-}"
     local result
     if [[ -n "$default" ]]; then
-        echo -en "${C}${prompt} [${default}]: ${N}"
+        echo -en "${C}${prompt} [${default}]: ${N}" >&2
     else
-        echo -en "${C}${prompt}: ${N}"
+        echo -en "${C}${prompt}: ${N}" >&2
     fi
     read -r result
     echo "${result:-$default}"
