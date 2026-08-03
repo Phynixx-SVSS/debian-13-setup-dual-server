@@ -49,6 +49,7 @@ add_single_server(){
 
     S_DIR="/home/fivem/${S_NAME}"
     mkdir -p "${S_DIR}/data"
+    mkdir -p "${S_DIR}/txData"
 
     START_SCRIPT="${S_DIR}/start_${S_NAME}.sh"
     STOP_SCRIPT="${S_DIR}/stop_${S_NAME}.sh"
@@ -56,7 +57,7 @@ add_single_server(){
     CONSOLE_SCRIPT="${S_DIR}/console_${S_NAME}.sh"
     PIN_SCRIPT="${S_DIR}/pin_${S_NAME}.sh"
 
-    # Start Skript mit verbesserter Fehlererfassung und Berechtigungsprüfung
+    # Start Skript mit isoliertem txDataPath, Port-Pruefung und korrekten Convars
     cat << EOF > "$START_SCRIPT"
 #!/bin/bash
 if screen -list | grep -q "\.${S_NAME}\s"; then
@@ -64,20 +65,30 @@ if screen -list | grep -q "\.${S_NAME}\s"; then
     exit 1
 fi
 
+# Pruefen ob der txAdmin Port belegt ist
+if lsof -i:${TX_PORT} >/dev/null 2>&1 || ss -tulpn | grep -q ":${TX_PORT}\s"; then
+    echo -e "\e[91mFEHLER: Port ${TX_PORT} ist bereits durch einen anderen Prozess belegt!\e[0m"
+    echo -e "\e[93mBelege Prozesse:\e[0m"
+    lsof -i:${TX_PORT} 2>/dev/null || ss -tulpn | grep ":${TX_PORT}"
+    echo -e "Bitte beende den Prozess (z.B. mit 'fuser -k ${TX_PORT}/tcp') oder wähle einen anderen Port."
+    exit 1
+fi
+
 echo "Starte FiveM Server '${S_NAME}' auf txAdmin Port ${TX_PORT}..."
 cd ${S_DIR}/data || exit 1
 
-# Rechte sicherstellen
 chmod -R +x /home/fivem/artifacts 2>/dev/null
 
-# Server via screen mit Log-Umleitung (stdout + stderr) starten
-screen -L -Logfile ${S_DIR}/txadmin.log -dmS ${S_NAME} bash -c "/home/fivem/artifacts/run.sh +set txAdminPort ${TX_PORT} +set txAdminServerProfile ${S_NAME} >> ${S_DIR}/txadmin.log 2>&1"
+# Log-Datei vor neuem Start leeren
+> ${S_DIR}/txadmin.log
 
-sleep 3
+# Server mit explizitem txDataPath und serverProfile isolieren
+screen -L -Logfile ${S_DIR}/txadmin.log -dmS ${S_NAME} bash -c "/home/fivem/artifacts/run.sh +set txAdminPort ${TX_PORT} +set txDataPath ${S_DIR}/txData +set serverProfile ${S_NAME} >> ${S_DIR}/txadmin.log 2>&1"
 
-# Pruefen ob der Screen noch laeuft
+sleep 4
+
 if screen -list | grep -q "\.${S_NAME}\s"; then
-    echo -e "\e[92mServer '${S_NAME}' erfolgreich in Screen-Session gestartet.\e[0m"
+    echo -e "\e[92mServer '${S_NAME}' erfolgreich gestartet.\e[0m"
     echo ""
     echo -e "\e[1m\e[93mTipp:\e[0m Zum Einsehen der Live-Konsole führe aus:"
     echo -e "  \e[96m/home/fivem/console_${S_NAME}.sh\e[0m  (oder \e[96mscreen -r ${S_NAME}\e[0m)"
@@ -92,22 +103,26 @@ else
     echo -e "\e[91mFEHLER: Server '${S_NAME}' konnte nicht gestartet werden!\e[0m"
     echo -e "\e[93mLetzte Log-Einträge (/home/fivem/${S_NAME}/txadmin.log):\e[0m"
     echo "----------------------------------------------------"
-    tail -n 20 ${S_DIR}/txadmin.log 2>/dev/null || echo "Kein Log vorhanden."
+    tail -n 25 ${S_DIR}/txadmin.log 2>/dev/null || echo "Kein Log vorhanden."
     echo "----------------------------------------------------"
 fi
 EOF
 
-    # Stop Skript
+    # Stop Skript mit Kill-Fallback für Portfreigabe
     cat << EOF > "$STOP_SCRIPT"
 #!/bin/bash
-if ! screen -list | grep -q "\.${S_NAME}\s"; then
-    echo "Server '${S_NAME}' läuft nicht."
-    exit 1
-fi
 echo "Stoppe FiveM Server '${S_NAME}'..."
-screen -S ${S_NAME} -X stuff $'\003'
-sleep 2
-screen -X -S ${S_NAME} quit 2>/dev/null
+if screen -list | grep -q "\.${S_NAME}\s"; then
+    screen -S ${S_NAME} -X stuff $'\003'
+    sleep 2
+    screen -X -S ${S_NAME} quit 2>/dev/null
+fi
+
+# Sicherstellen, dass Port freigegeben ist
+fuser -k ${TX_PORT}/tcp >/dev/null 2>&1
+fuser -k ${GAME_PORT}/tcp >/dev/null 2>&1
+fuser -k ${GAME_PORT}/udp >/dev/null 2>&1
+
 echo "Server '${S_NAME}' gestoppt."
 EOF
 
@@ -270,7 +285,7 @@ menu_add_server(){
     echo -e "\n${green}${bold}Server '${S_NAME}' erfolgreich hinzugefügt!${reset}"
     echo -e "  Starten:      ${yellow}runuser -u fivem -- /home/fivem/start_${S_NAME}.sh${reset}"
     echo -e "  Live-Konsole: ${yellow}runuser -u fivem -- /home/fivem/console_${S_NAME}.sh${reset}"
-    echo -e "  Stoppen:      ${yellow}runuser -u fivem -- /home/fivem/stop_${S_NAME}.sh${reset}"
+    echo -e "  Stoppen:      ${yellow}su - fivem -c '/home/fivem/stop_${S_NAME}.sh'${reset}"
     echo -e "  txAdmin:      ${blue}http://${IP}:${TX_PORT}${reset}"
 }
 
