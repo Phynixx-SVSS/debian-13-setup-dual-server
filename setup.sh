@@ -56,27 +56,44 @@ add_single_server(){
     CONSOLE_SCRIPT="${S_DIR}/console_${S_NAME}.sh"
     PIN_SCRIPT="${S_DIR}/pin_${S_NAME}.sh"
 
-    # Start Skript
+    # Start Skript mit verbesserter Fehlererfassung und Berechtigungsprüfung
     cat << EOF > "$START_SCRIPT"
 #!/bin/bash
 if screen -list | grep -q "\.${S_NAME}\s"; then
-    echo "Server '${S_NAME}' läuft bereits!"
+    echo -e "\e[93mServer '${S_NAME}' läuft bereits!\e[0m"
     exit 1
 fi
+
 echo "Starte FiveM Server '${S_NAME}' auf txAdmin Port ${TX_PORT}..."
 cd ${S_DIR}/data || exit 1
-screen -L -Logfile ${S_DIR}/txadmin.log -dmS ${S_NAME} /home/fivem/artifacts/run.sh +set txAdminPort ${TX_PORT} +set txAdminServerProfile ${S_NAME}
-echo "Server '${S_NAME}' gestartet."
-echo ""
-echo -e "\e[1m\e[93mTipp:\e[0m Zum Einsehen der Live-Konsole führe aus:"
-echo -e "  \e[96m/home/fivem/console_${S_NAME}.sh\e[0m  (oder \e[96mscreen -r ${S_NAME}\e[0m)"
-echo ""
-sleep 2
-PIN=\$(grep -oP 'PIN:\s*\K[0-9]{4}' ${S_DIR}/txadmin.log 2>/dev/null | tail -n 1)
-if [ -n "\$PIN" ]; then
-    echo -e "\e[1m\e[92m====================================\e[0m"
-    echo -e "\e[1m\e[92m  txAdmin Setup PIN: \e[93m\$PIN\e[0m"
-    echo -e "\e[1m\e[92m====================================\e[0m"
+
+# Rechte sicherstellen
+chmod -R +x /home/fivem/artifacts 2>/dev/null
+
+# Server via screen mit Log-Umleitung (stdout + stderr) starten
+screen -L -Logfile ${S_DIR}/txadmin.log -dmS ${S_NAME} bash -c "/home/fivem/artifacts/run.sh +set txAdminPort ${TX_PORT} +set txAdminServerProfile ${S_NAME} >> ${S_DIR}/txadmin.log 2>&1"
+
+sleep 3
+
+# Pruefen ob der Screen noch laeuft
+if screen -list | grep -q "\.${S_NAME}\s"; then
+    echo -e "\e[92mServer '${S_NAME}' erfolgreich in Screen-Session gestartet.\e[0m"
+    echo ""
+    echo -e "\e[1m\e[93mTipp:\e[0m Zum Einsehen der Live-Konsole führe aus:"
+    echo -e "  \e[96m/home/fivem/console_${S_NAME}.sh\e[0m  (oder \e[96mscreen -r ${S_NAME}\e[0m)"
+    echo ""
+    PIN=\$(grep -oP 'PIN:\s*\K[0-9]{4}' ${S_DIR}/txadmin.log 2>/dev/null | tail -n 1)
+    if [ -n "\$PIN" ]; then
+        echo -e "\e[1m\e[92m====================================\e[0m"
+        echo -e "\e[1m\e[92m  txAdmin Setup PIN: \e[93m\$PIN\e[0m"
+        echo -e "\e[1m\e[92m====================================\e[0m"
+    fi
+else
+    echo -e "\e[91mFEHLER: Server '${S_NAME}' konnte nicht gestartet werden!\e[0m"
+    echo -e "\e[93mLetzte Log-Einträge (/home/fivem/${S_NAME}/txadmin.log):\e[0m"
+    echo "----------------------------------------------------"
+    tail -n 20 ${S_DIR}/txadmin.log 2>/dev/null || echo "Kein Log vorhanden."
+    echo "----------------------------------------------------"
 fi
 EOF
 
@@ -123,7 +140,7 @@ if [ -f "${S_DIR}/txadmin.log" ]; then
     if [ -n "\$PIN" ]; then
         echo -e "\e[1m\e[92mtxAdmin PIN für ${S_NAME}: \e[93m\$PIN\e[0m"
     else
-        echo "Kein PIN im Log gefunden. Öffne die Konsole via /home/fivem/console_${S_NAME}.sh"
+        echo "Kein PIN im Log gefunden. Siehe Konsole: /home/fivem/console_${S_NAME}.sh"
     fi
 else
     echo "Logdatei existiert nicht. Starte den Server zuerst."
@@ -251,9 +268,9 @@ menu_add_server(){
 
     IP=$(get_server_ip)
     echo -e "\n${green}${bold}Server '${S_NAME}' erfolgreich hinzugefügt!${reset}"
-    echo -e "  Starten:      ${yellow}su - fivem -c '/home/fivem/start_${S_NAME}.sh'${reset}"
-    echo -e "  Live-Konsole: ${yellow}su - fivem -c '/home/fivem/console_${S_NAME}.sh'${reset}"
-    echo -e "  Stoppen:      ${yellow}su - fivem -c '/home/fivem/stop_${S_NAME}.sh'${reset}"
+    echo -e "  Starten:      ${yellow}runuser -u fivem -- /home/fivem/start_${S_NAME}.sh${reset}"
+    echo -e "  Live-Konsole: ${yellow}runuser -u fivem -- /home/fivem/console_${S_NAME}.sh${reset}"
+    echo -e "  Stoppen:      ${yellow}runuser -u fivem -- /home/fivem/stop_${S_NAME}.sh${reset}"
     echo -e "  txAdmin:      ${blue}http://${IP}:${TX_PORT}${reset}"
 }
 
@@ -367,6 +384,7 @@ full_installation(){
     LATEST_LINK=$(curl -s https://runtime.fivem.net/artifacts/fivem/build_proot_linux/master/ | grep -oP 'href="\./\K[0-9]+-[a-f0-9]+/fx\.tar\.xz' | tail -n 1)
     wget -q https://runtime.fivem.net/artifacts/fivem/build_proot_linux/master/$LATEST_LINK -O fx.tar.xz
     tar -xf fx.tar.xz && rm fx.tar.xz
+    chmod -R +x /home/fivem/artifacts
 
     cat << 'EOF' > /home/fivem/start_all.sh
 #!/bin/bash
@@ -382,6 +400,8 @@ EOF
         echo "/home/fivem/${SERVER_NAMES[$i]}/start_${SERVER_NAMES[$i]}.sh" >> /home/fivem/start_all.sh
         echo "/home/fivem/${SERVER_NAMES[$i]}/stop_${SERVER_NAMES[$i]}.sh" >> /home/fivem/stop_all.sh
     done
+
+    chown -R fivem:fivem /home/fivem
 
     # Firewall
     ufw allow ${SSH_PORT}/tcp comment 'SSH Port' >/dev/null 2>&1
@@ -441,11 +461,11 @@ manage_servers_menu(){
     read -r -p "Auswahl [1-5]: " ACT
 
     case $ACT in
-        1) su - fivem -c "/home/fivem/${CHOSEN}/start_${CHOSEN}.sh" ;;
-        2) su - fivem -c "/home/fivem/${CHOSEN}/stop_${CHOSEN}.sh" ;;
-        3) su - fivem -c "/home/fivem/${CHOSEN}/restart_${CHOSEN}.sh" ;;
-        4) su - fivem -c "/home/fivem/${CHOSEN}/console_${CHOSEN}.sh" ;;
-        5) su - fivem -c "/home/fivem/${CHOSEN}/pin_${CHOSEN}.sh" ;;
+        1) runuser -u fivem -- "/home/fivem/${CHOSEN}/start_${CHOSEN}.sh" ;;
+        2) runuser -u fivem -- "/home/fivem/${CHOSEN}/stop_${CHOSEN}.sh" ;;
+        3) runuser -u fivem -- "/home/fivem/${CHOSEN}/restart_${CHOSEN}.sh" ;;
+        4) runuser -u fivem -- "/home/fivem/${CHOSEN}/console_${CHOSEN}.sh" ;;
+        5) runuser -u fivem -- "/home/fivem/${CHOSEN}/pin_${CHOSEN}.sh" ;;
     esac
     echo ""
     read -r -p "Taste drücken zum Fortfahren..."
