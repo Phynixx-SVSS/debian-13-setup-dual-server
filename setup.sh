@@ -1359,6 +1359,70 @@ EOSERVICE
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Vollständige Deinstallation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+uninstall_all() {
+    banner
+    echo -e "${R}═══════════════════════════════════════════════════════════${N}"
+    echo -e "${R}  Vollständige Deinstallation${N}"
+    echo -e "${R}═══════════════════════════════════════════════════════════${N}"
+    echo ""
+    log_warn "ACHTUNG: Dies entfernt alle FiveM-Server, Artifacts, phpMyAdmin,"
+    log_warn "Nginx-, MariaDB- und PHP-Pakete sowie alle Daten und Konfigurationen!"
+    echo ""
+
+    if ! confirm "Möchtest du wirklich ALLES deinstallieren?"; then
+        log_info "Deinstallation abgebrochen."
+        return 0
+    fi
+
+    log_step "1. Stopper alle FiveM-Server & Screen-Sessions..."
+    for svc in /etc/systemd/system/fivem-*.service; do
+        if [[ -f "$svc" ]]; then
+            local sname
+            sname=$(basename "$svc")
+            systemctl stop "$sname" 2>/dev/null || true
+            systemctl disable "$sname" 2>/dev/null || true
+            rm -f "$svc"
+        fi
+    done
+    systemctl daemon-reload
+
+    for s in $(screen -ls 2>/dev/null | grep 'fivem-' | awk '{print $1}'); do
+        screen -S "$s" -X quit 2>/dev/null || true
+    done
+
+    log_step "2. Web- & Datenbankdienste stoppen & entfernen..."
+    export DEBIAN_FRONTEND=noninteractive
+
+    systemctl stop nginx 2>/dev/null || true
+    systemctl stop mariadb 2>/dev/null || true
+    systemctl stop apache2 2>/dev/null || true
+    systemctl stop php*-fpm 2>/dev/null || true
+
+    apt-get purge -y nginx nginx-common nginx-core mariadb-server mariadb-client php* apache2* 2>/dev/null || true
+    apt-get autoremove --purge -y 2>/dev/null || true
+
+    log_step "3. Verzeichnisse & Konfigurationen löschen..."
+    rm -rf /opt/fivem
+    rm -rf /usr/share/phpmyadmin
+    rm -rf /etc/nginx/sites-available/phpmyadmin /etc/nginx/sites-enabled/phpmyadmin
+    rm -rf "$CONFIG_DIR"
+    rm -rf "$LOG_DIR"
+    rm -rf /var/lib/mysql /etc/mysql /var/log/mysql 2>/dev/null || true
+
+    log_step "4. System-Benutzer entfernen..."
+    if [[ -n "${FIVEM_USER:-}" ]] && id "$FIVEM_USER" &>/dev/null; then
+        userdel -r "$FIVEM_USER" 2>/dev/null || userdel "$FIVEM_USER" 2>/dev/null || true
+        log_ok "Benutzer '${FIVEM_USER}' entfernt."
+    fi
+
+    separator
+    log_ok "Vollständige Deinstallation erfolgreich abgeschlossen."
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Hauptmenü
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1391,6 +1455,7 @@ main_menu() {
         separator
         echo ""
         echo -e "  ${C}9)${N}  ${W}Erstinstallation${N}                (Nginx/MariaDB/phpMyAdmin/FiveM)"
+        echo -e "  ${R}10)${N} ${W}Deinstallation${N}                  (Alles entfernen)"
         echo -e "  ${C}0)${N}  ${W}Beenden${N}"
         echo ""
 
@@ -1407,6 +1472,7 @@ main_menu() {
             7) menu_firewall ;;
             8) menu_extras ;;
             9) initial_setup ;;
+            10) uninstall_all ;;
             0)
                 echo ""
                 log_info "Beendet."
@@ -1436,6 +1502,12 @@ main() {
                 export AUTO_INSTALL=1
             fi
             initial_setup
+            ;;
+        uninstall)
+            if [[ "${2:-}" == "-y" || "${2:-}" == "--auto" ]]; then
+                export AUTO_INSTALL=1
+            fi
+            uninstall_all
             ;;
         start)
             if [[ -n "${2:-}" ]]; then
@@ -1491,6 +1563,7 @@ main() {
             echo ""
             echo "Befehle:"
             echo "  install              Erstinstallation"
+            echo "  uninstall            Vollständige Deinstallation"
             echo "  start [name]         Server starten (alle wenn kein Name)"
             echo "  stop [name]          Server stoppen (alle wenn kein Name)"
             echo "  restart [name]       Server neustarten (alle wenn kein Name)"
