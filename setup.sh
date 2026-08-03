@@ -54,19 +54,26 @@ banner() {
 confirm() {
     local prompt="$1"
     local answer
+    if [[ "${AUTO_INSTALL:-0}" == "1" ]]; then
+        return 0
+    fi
     echo -en "${Y}${prompt} [j/N]: ${N}"
     if [[ -c /dev/tty ]]; then
         read -r answer </dev/tty
     else
-        read -r answer
+        read -r answer || answer="j"
     fi
-    [[ "$answer" =~ ^[jJyY]$ ]]
+    [[ "$answer" =~ ^[jJyY]$ ]] || [[ -z "$answer" && "${AUTO_INSTALL:-0}" == "1" ]]
 }
 
 read_input() {
     local prompt="$1"
     local default="${2:-}"
-    local result
+    local result=""
+    if [[ "${AUTO_INSTALL:-0}" == "1" ]]; then
+        echo "$default"
+        return 0
+    fi
     if [[ -n "$default" ]]; then
         echo -en "${C}${prompt} [${default}]: ${N}" >&2
     else
@@ -75,7 +82,7 @@ read_input() {
     if [[ -c /dev/tty ]]; then
         read -r result </dev/tty
     else
-        read -r result
+        read -r result || result="$default"
     fi
     echo "${result:-$default}"
 }
@@ -156,9 +163,10 @@ gen_password() {
 
 install_dependencies() {
     log_step "System-Pakete aktualisieren & Abhängigkeiten installieren..."
+    export DEBIAN_FRONTEND=noninteractive
     apt-get update -y
     apt-get upgrade -y
-    apt-get install -y \
+    apt-get install -y --no-install-recommends \
         curl wget git unzip xz-utils screen htop \
         ufw psmisc net-tools lsof \
         software-properties-common apt-transport-https \
@@ -170,24 +178,35 @@ install_dependencies() {
 install_nginx() {
     log_step "Nginx installieren..."
 
-    # Konfliktbehebung: Apache2 stoppen und entfernen (wird von PHP-Paketen auf Debian oft nachinstalliert)
+    export DEBIAN_FRONTEND=noninteractive
+
+    # Konfliktbehebung: Apache2 & Port 80 Prozesse stoppen/killen
     systemctl stop apache2 2>/dev/null || true
     systemctl disable apache2 2>/dev/null || true
+    pkill -9 apache2 2>/dev/null || true
+    fuser -k 80/tcp 2>/dev/null || true
     apt-get purge -y apache2 apache2-utils apache2-bin 2>/dev/null || true
 
-    apt-get install -y nginx
+    apt-get install -y --no-install-recommends nginx
 
-    # Port-Konflikte aufräumen
+    # Port-Konflikte & Default-Site aufräumen
     rm -f /etc/nginx/sites-enabled/default
 
     systemctl enable nginx
-    systemctl restart nginx
-    log_ok "Nginx installiert und gestartet."
+    if nginx -t; then
+        systemctl restart nginx
+        log_ok "Nginx installiert und gestartet."
+    else
+        log_error "Nginx Konfigurationsprüfung fehlgeschlagen."
+        nginx -t
+        return 1
+    fi
 }
 
 install_mariadb() {
     log_step "MariaDB installieren..."
-    apt-get install -y mariadb-server mariadb-client
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get install -y --no-install-recommends mariadb-server mariadb-client
 
     systemctl enable mariadb
     systemctl start mariadb
@@ -223,6 +242,7 @@ EOSQL
 install_phpmyadmin() {
     log_step "phpMyAdmin installieren..."
 
+    export DEBIAN_FRONTEND=noninteractive
     local pma_dir="/usr/share/phpmyadmin"
     local pma_version="5.2.2"
     local pma_url="https://files.phpmyadmin.net/phpMyAdmin/${pma_version}/phpMyAdmin-${pma_version}-all-languages.tar.gz"
@@ -230,18 +250,20 @@ install_phpmyadmin() {
     # Apache2 sicherheitshalber erneut stoppen & säubern
     systemctl stop apache2 2>/dev/null || true
     systemctl disable apache2 2>/dev/null || true
+    pkill -9 apache2 2>/dev/null || true
     apt-get purge -y apache2 apache2-utils apache2-bin 2>/dev/null || true
 
     # PHP installieren
-    apt-get install -y php-fpm php-mysql php-mbstring php-zip php-gd php-json php-curl php-xml
+    apt-get install -y --no-install-recommends php-fpm php-mysql php-mbstring php-zip php-gd php-json php-curl php-xml
 
-    # PHP-FPM Version ermitteln
+    # PHP-FPM Version & Socket ermitteln
     local php_ver
     php_ver=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
     local php_sock="/run/php/php${php_ver}-fpm.sock"
 
     systemctl enable "php${php_ver}-fpm" 2>/dev/null || true
     systemctl restart "php${php_ver}-fpm" 2>/dev/null || true
+    sleep 1
 
     # phpMyAdmin herunterladen
     if [[ ! -d "$pma_dir" ]]; then
@@ -262,7 +284,8 @@ install_phpmyadmin() {
         chown -R www-data:www-data "$pma_dir"
     fi
 
-    # Nginx Server-Block für phpMyAdmin
+    # Port 8080 freimachen & Nginx Server-Block für phpMyAdmin
+    fuser -k 8080/tcp 2>/dev/null || true
     mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
     cat > /etc/nginx/sites-available/phpmyadmin <<EONGINX
 server {
@@ -292,8 +315,14 @@ EONGINX
     ln -sf /etc/nginx/sites-available/phpmyadmin /etc/nginx/sites-enabled/
     rm -f /etc/nginx/sites-enabled/default
 
-    nginx -t && systemctl restart nginx
-    log_ok "phpMyAdmin installiert — erreichbar auf Port 8080."
+    if nginx -t; then
+        systemctl restart nginx
+        log_ok "phpMyAdmin installiert — erreichbar auf Port 8080."
+    else
+        log_error "Nginx Konfigurationsfehler."
+        nginx -t
+        return 1
+    fi
 }
 
 download_fivem_artifacts() {
@@ -1403,6 +1432,9 @@ main() {
     # Wenn als Argument ein Befehl übergeben wird — Direktmodus
     case "${1:-}" in
         install)
+            if [[ "${2:-}" == "-y" || "${2:-}" == "--auto" ]]; then
+                export AUTO_INSTALL=1
+            fi
             initial_setup
             ;;
         start)
